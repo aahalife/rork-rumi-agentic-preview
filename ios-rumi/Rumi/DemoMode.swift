@@ -24,6 +24,8 @@ struct DemoTurn: Identifiable, Codable {
     var role: String
     var text: String
     var kind: String = "conversation"
+    var insights: [DemoInsight]?
+    var invitesGoal: Bool?
 }
 enum DemoTimeline {
     static func date(daysAgo: Int) -> Date { Calendar.current.date(byAdding: .day, value: -daysAgo, to: DemoSession.shared.state.anchorDate ?? Calendar.current.startOfDay(for: Date()))! }
@@ -64,6 +66,7 @@ final class DemoSession {
     var member: DemoMember = .primary
     var revision = UUID()
     var busy = false
+    var progress = "Rumi is thinking…"
     var error: String?
     var pendingGoal: String?
     var showTrends = false
@@ -131,7 +134,8 @@ final class DemoSession {
         \(state.remembering ? "Authorized local demo goals: " + state.goals.joined(separator: "; ") : "")
         Demo cart: \(state.cart.joined(separator: "; ")). \(state.remembering ? "Authorized local demo receipts: " + state.receipts.prefix(8).map(\.text).joined(separator: "; ") : "No prior receipt recall is authorized.")
         Mock service state: saved seeded recipes \(state.mockSavedRecipes?.joined(separator: "; ") ?? "none"); ride rehearsal \(state.mockRideReceipt ?? "none"). Simulation data, not real service history.
-        Available UI proposal tools: propose_goal, show_health, propose_groceries, show_demo_services. They do not execute changes. Other tools named in the supplied prompt are NOT installed. Never invent their results.
+        INSIGHTS POLICY (overrides conflicting instructions): Describe, never assess clinical values. Do not call a reading good/bad, healthy/unhealthy, normal/abnormal, better/worse or on target. Do not infer causes or patterns between measures. Do not invent ranges, targets, percentiles or comparison populations. For explicit requests to show/latest/last-N/trend/compare data, use read_demo_insights; the host computes facts and inline charts, not the model. Bundle multiple requests in its requests array; each retains its own dates and units. Primary has HbA1c/LDL-C/eGFR only; Maria HbA1c/Weight; Tom HbA1c/Weight/Sleep/Activity. Missing BMI, CGM, time-in-range and cohort datasets stay unavailable. Primary dates are illustrative. A1c change uses percentage points. Never look up a number merely mentioned in goal talk or a CGM device problem. Do not retract available sample data. No unsolicited tips: first ask an open question about the person's chosen goal after they accept an invitation. Plain answers to your questions are not requests for advice. Medication, refill, referral and lab-order actions remain reviewed local rehearsals, not live actions.
+        Available tools: read_demo_insights (read-only calculated facts), propose_goal, show_health, propose_groceries, show_demo_services (UI proposals only). Other tools named in the supplied prompt are NOT installed. Never invent their results.
         Local date: \(Date().formatted(date: .complete, time: .omitted)). Any selected future story event is fictional, not actual current treatment.
         """
     }
@@ -145,11 +149,16 @@ final class DemoSession {
         guard !text.isEmpty, !busy else { return }
         guard promptAvailable else { error = "The supplied agent prompt is missing from this build. Demo AI is unavailable; no replacement prompt was used."; return }
         guard text.count <= 6000 else { error = "Please keep messages under 6,000 characters."; return }
+        let acceptsInvitation = state.messages.last?.invitesGoal == true && ["yes", "yes please", "sure", "okay", "ok"].contains(text.lowercased().trimmingCharacters(in: .punctuationCharacters))
         stop(); error = nil
         update { $0.messages.append(DemoTurn(role: "user", text: text)) }
-        busy = true
+        if acceptsInvitation {
+            update { $0.messages.append(DemoTurn(role: "assistant", text: "What would you like to work toward, in your own words?", kind: "host-coaching")) }
+            return
+        }
+        busy = true; progress = DemoInsightEngine.isExplicitDataRequest(text) ? "Reading your request · Sonnet 5.5…" : "Rumi is thinking…"
         let version = revision, selected = member
-        let history = state.messages.filter { $0.kind == "conversation" }.suffix(24)
+        let history = state.messages.filter { $0.kind != "voice" }.suffix(24)
         let instructions = instructions
         task = Task { [weak self] in
             do {
@@ -159,26 +168,42 @@ final class DemoSession {
                 request.setValue("Bearer \(DemoToolkit.accessKey)", forHTTPHeaderField: "Authorization")
                 request.setValue("application/json", forHTTPHeaderField: "Content-Type")
                 let tools: [[String: Any]] = [
+                    DemoInsightEngine.tool,
                     ["type": "function", "function": ["name": "propose_goal", "description": "Propose a nonclinical goal for native review. Does not save it.", "parameters": ["type": "object", "properties": ["text": ["type": "string"]], "required": ["text"], "additionalProperties": false]]],
                     ["type": "function", "function": ["name": "show_health", "description": "Offer the matching synthetic trend. Sleep and Activity are available for Tom only.", "parameters": ["type": "object", "properties": ["metric": ["type": "string", "enum": ["HbA1c", "Weight", "Sleep", "Activity", "LDL-C", "eGFR"]]], "required": ["metric"], "additionalProperties": false]]],
                     ["type": "function", "function": ["name": "show_demo_services", "description": "Open labelled local Instagram, Instacart and Uber simulations; no external actions.", "parameters": ["type": "object", "properties": [:]]]],
                     ["type": "function", "function": ["name": "propose_groceries", "description": "Offer the demo grocery review. No merchant changes.", "parameters": ["type": "object", "properties": [:]]]]
                 ]
-                request.httpBody = try JSONSerialization.data(withJSONObject: ["model": "anthropic/claude-sonnet-5.5", "messages": [["role": "system", "content": instructions]] + history.map { ["role": $0.role, "content": $0.text] }, "max_tokens": 1200, "tools": tools])
+                var payload: [String: Any] = ["model": "anthropic/claude-sonnet-5.5", "messages": [["role": "system", "content": instructions]] + history.map { ["role": $0.role, "content": $0.text + (($0.insights ?? []).isEmpty ? "" : "\nApp-calculated sample facts:\n" + ($0.insights ?? []).map(\.facts).joined(separator: "\n"))] }, "max_tokens": 1600, "tools": tools]
+                if DemoInsightEngine.isExplicitDataRequest(text) { payload["tool_choice"] = ["type": "function", "function": ["name": "read_demo_insights"]] }
+                request.httpBody = try JSONSerialization.data(withJSONObject: payload)
                 let (data, response) = try await URLSession.shared.data(for: request)
                 try Task.checkCancellation()
                 guard let response = response as? HTTPURLResponse, (200...299).contains(response.statusCode) else { throw CompanionError(message: "Sonnet 5.5 could not complete this request. No fallback was used. Please try again later.") }
                 let decoded = try JSONDecoder().decode(DemoAIReply.self, from: data)
                 guard let reply = decoded.choices.first?.message else { throw CompanionError(message: "The AI returned no reply.") }
                 guard let self, self.revision == version, self.member == selected else { return }
+                let insightCalls = (reply.tool_calls ?? []).filter { $0.function.name == "read_demo_insights" }
+                if DemoInsightEngine.isExplicitDataRequest(text), insightCalls.isEmpty { throw CompanionError(message: "Sonnet 5.5 did not return the required read-only insight query. No unverified numerical reply was displayed.") }
+                if !insightCalls.isEmpty {
+                    guard DemoInsightEngine.isExplicitDataRequest(text), insightCalls.count == 1 else { throw CompanionError(message: "No data lookup was performed. Please explicitly ask to show a trend, latest value or comparison.") }
+                    self.progress = "Calculating sample facts & building charts…"
+                    let queries = try DemoInsightEngine.parseQueries(insightCalls[0].function.arguments)
+                    let anchor = self.state.anchorDate ?? Calendar.current.startOfDay(for: Date())
+                    let insights = try queries.map { try DemoInsightEngine.evaluate($0, member: selected, anchor: anchor) }
+                    // Model narration is deliberately not published alongside numerical results.
+                    // Chart labels and numerical sentences come solely from the deterministic engine.
+                    self.update { $0.messages.append(DemoTurn(role: "assistant", text: "Here are the available sample facts. Would you like to talk about a goal that matters to you?", kind: "calculated-insight", insights: insights, invitesGoal: true)) }
+                    self.busy = false
+                    return
+                }
                 if let content = reply.content, !content.isEmpty { self.update { $0.messages.append(DemoTurn(role: "assistant", text: content)) } }
                 for call in reply.tool_calls ?? [] {
                     switch call.function.name {
                     case "propose_goal":
                         if let data = call.function.arguments.data(using: .utf8), let object = try? JSONSerialization.jsonObject(with: data) as? [String: String], let goal = object["text"], !goal.isEmpty { self.pendingGoal = String(goal.prefix(500)) }
                     case "show_health":
-                        if let data = call.function.arguments.data(using: .utf8), let object = try? JSONSerialization.jsonObject(with: data) as? [String: String], let metric = object["metric"], (selected == .primary ? ["HbA1c", "LDL-C", "eGFR"] : selected == .tom ? ["HbA1c", "Weight", "Sleep", "Activity"] : ["HbA1c", "Weight"]).contains(metric) { self.requestedMetric = metric }
-                        self.showTrends = true
+                        if let data = call.function.arguments.data(using: .utf8), let object = try? JSONSerialization.jsonObject(with: data) as? [String: String], let metric = object["metric"], DemoMetric.available(for: selected).map(\.rawValue).contains(metric) { self.requestedMetric = metric; self.showTrends = true }
                     case "propose_groceries": self.showGroceries = true
                     case "show_demo_services": self.showServices = true
                     default: break
@@ -223,10 +248,10 @@ struct DemoEntryView: View {
                                 VStack(alignment: .leading, spacing: 5) { Text(member.name).font(.title3.bold()); Text(member == .primary ? member.subtitle + " · Age not supplied" : "Age \(member.age.map(String.init) ?? "Not supplied") · \(member.subtitle)").font(.body) }
                                 Spacer(); Image(systemName: selected == member ? "checkmark.circle.fill" : "circle").font(.title2)
                             }.padding(18).background(.white.opacity(selected == member ? 0.9 : 0.4), in: RoundedRectangle(cornerRadius: 24))
-                        }.buttonStyle(.plain).foregroundStyle(Color.brandPrimary).accessibilityAddTraits(selected == member ? .isSelected : [])
+                        }.buttonStyle(.plain).foregroundStyle(Color.brandPrimary).accessibilityIdentifier("demo.member.\(member.rawValue)").accessibilityAddTraits(selected == member ? .isSelected : [])
                     }
                     Label("Fictional records stay separate from real care.", systemImage: "lock.shield").font(.callout)
-                    Button("Start demo with \(selected.name.components(separatedBy: " ")[0])") { DemoSession.shared.select(selected); started = true }.buttonStyle(.borderedProminent).controlSize(.large).tint(Color.brandPrimary).frame(maxWidth: .infinity)
+                    Button("Start demo with \(selected.name.components(separatedBy: " ")[0])") { DemoSession.shared.select(selected); started = true }.buttonStyle(.borderedProminent).controlSize(.large).tint(Color.brandPrimary).frame(maxWidth: .infinity).accessibilityIdentifier("demo.start")
                     Text("Messages and microphone audio are processed by AI providers. Please don’t enter real patient information in this demo.").font(.footnote).foregroundStyle(.secondary)
                 }.padding(24)
             }.background { AmbientBackground() }.toolbar { ToolbarItem(placement: .topBarTrailing) { Button("Close") { DemoSession.shared.isPresented = false; dismiss() }.frame(minHeight: 44) } }
@@ -267,17 +292,22 @@ struct DemoHomeView: View {
                             }
                             ForEach(demo.state.messages) { turn in
                                 VStack(alignment: .leading, spacing: 6) {
-                                    Text(turn.role == "user" ? "You" : "Rumi · Live AI").font(.caption.bold()).foregroundStyle(.secondary)
+                                    Text(turn.role == "user" ? "You" : turn.kind == "calculated-insight" ? "Rumi · Sonnet-selected query · App-calculated facts" : turn.kind == "host-coaching" ? "Rumi · Guided next step" : "Rumi · Live AI").font(.caption.bold()).foregroundStyle(.secondary)
+                                    ForEach(turn.insights ?? []) { insight in DemoInsightCard(insight: insight) }
                                     Text(turn.text).font(.body).textSelection(.enabled)
+                                    if turn.invitesGoal == true, demo.state.messages.last?.id == turn.id {
+                                        Button("Yes, talk about my goal") { demo.send("Yes") }.buttonStyle(.bordered).frame(minHeight: 44).disabled(demo.busy)
+                                    }
                                 }.padding(16).frame(maxWidth: .infinity, alignment: .leading).background(turn.role == "user" ? Color.brandPrimary.opacity(0.08) : .white.opacity(0.65), in: RoundedRectangle(cornerRadius: 20))
                             }
-                            if demo.busy { HStack { ProgressView(); Text("Rumi is thinking…"); Spacer(); Button("Stop") { demo.stop() }.frame(minHeight: 44) } }
+                            if demo.busy { HStack { ProgressView(); Text(demo.progress); Spacer(); Button("Stop") { demo.stop() }.frame(minHeight: 44) } }
                             if let error = demo.error { Text(error).foregroundStyle(.red).font(.callout) }
                             if let proposed = demo.pendingGoal { Button("Review proposed goal: \(proposed)") { reviewedGoal = proposed }.buttonStyle(.bordered).frame(minHeight: 44) }
                             VStack(alignment: .leading, spacing: 4) {
                                 if demo.member == .primary {
                                     suggestion("Review my repeat labs with Rumi", icon: "bubble.left") { demo.send("Using the supplied fictional profile, help prepare PCP questions about A1c 9.0 to 8.8%, LDL-C 130 to 130 mg/dL and eGFR 60 to 55 mL/min/1.73 m². Do not recommend medication changes.") }
                                 }
+                                suggestion("Insights walkthrough · Charts in chat", icon: "chart.bar.xaxis") { path.append("insights") }.accessibilityIdentifier("demo.insights.walkthrough")
                                 suggestion("Demo services · Instagram, Instacart & Uber", icon: "rectangle.on.rectangle") { path.append("services") }
                                 if demo.member != .primary { suggestion(demo.member == .maria ? "Is my A1c change progress?" : "Help me fit a walk into a busy day", icon: "bubble.left") { demo.send(demo.member == .maria ? "My sample A1c is 7.8%, down from 8.6%. Help me understand the change and prepare a question for my care team." : "I can manage a short lunch walk but not a whole workout. Help me find a manageable next step.") } }
                                 suggestion("Explore health & care story", icon: "chart.xyaxis.line") { path.append("health") }
@@ -301,7 +331,7 @@ struct DemoHomeView: View {
                 }.padding(.horizontal, 16).padding(.vertical, 10).background(.regularMaterial)
             }
             .navigationDestination(for: String.self) { page in
-                switch page { case "services": DemoServicesView(); case "browser": DemoBrowserView(); case "health": DemoHealthView(initialMetric: demo.requestedMetric); case "groceries": DemoGroceriesView(); case "goals": goalsView; default: DemoOutreachView() }
+                switch page { case "insights": DemoInsightsWalkthrough(); case "services": DemoServicesView(); case "browser": DemoBrowserView(); case "health": DemoHealthView(initialMetric: demo.requestedMetric); case "groceries": DemoGroceriesView(); case "goals": goalsView; default: DemoOutreachView() }
             }
             .sheet(isPresented: $voice) { DemoVoiceView() }
             .sheet(item: Binding(get: { reviewedGoal.map { DemoGoalReview(text: $0) } }, set: { reviewedGoal = $0?.text })) { review in
@@ -348,19 +378,10 @@ struct DemoHealthView: View {
     private var unit: String { switch metric { case "Weight": "lb"; case "Sleep": "hours"; case "Activity": "steps"; case "LDL-C": "mg/dL"; case "eGFR": "mL/min/1.73 m²"; default: "%" } }
     private func date(_ days: Int) -> Date { DemoTimeline.date(daysAgo: days) }
     private var points: [DemoPoint] {
-        let maria = demo.member == .maria
-        let all: [DemoPoint]
-        if demo.member == .primary {
-            let values: [Double] = metric == "LDL-C" ? [130, 130] : metric == "eGFR" ? [60, 55] : [9.0, 8.8]
-            return zip([270, 70], values).map { DemoPoint(date: date($0.0), value: $0.1) }.filter { days == 0 || $0.date >= date(days) }
-        }
-        switch metric {
-        case "Weight": all = zip([92, 60, 30, 0], maria ? [216.7, 214.2, 211.4, 208.7] : [228, 226.5, 225.8, 224]).map { DemoPoint(date: date($0.0), value: $0.1) }
-        case "Sleep": all = (0..<14).map { DemoPoint(date: date(13 - $0), value: 6.4 + [0.2, -0.4, 0.5, -0.1, -0.3, 0.1, 0.0][$0 % 7]) }
-        case "Activity": all = (0..<14).map { DemoPoint(date: date(13 - $0), value: Double(4800 + [400, -600, 800, -300, -400, 100, 0][$0 % 7])) }
-        default: all = maria ? [DemoPoint(date: date(92), value: 8.6), DemoPoint(date: date(50), value: 8.2), DemoPoint(date: date(0), value: 7.8)] : [DemoPoint(date: date(0), value: 5.8)]
-        }
-        return all.filter { days == 0 || $0.date >= date(days) }
+        guard let selectedMetric = DemoMetric(rawValue: metric) else { return [] }
+        let anchor = demo.state.anchorDate ?? Calendar.current.startOfDay(for: Date())
+        return DemoInsightEngine.observations(member: demo.member, metric: selectedMetric, anchor: anchor)
+            .filter { days == 0 || $0.date >= date(days) }.map { DemoPoint(date: $0.date, value: $0.value) }
     }
     private var highlighted: DemoPoint? { guard let selected else { return points.last }; return points.min { abs($0.date.timeIntervalSince(selected)) < abs($1.date.timeIntervalSince(selected)) } }
     var body: some View {

@@ -1,0 +1,58 @@
+{
+  "spec_sha256": "05393d3a2d03dee6bf3812edafb435abf235cde07cb95b9f9a1b820cf5096dea",
+  "tested_documented_origin": "https://egoicdonmuudwvbsockm.supabase.co/functions/v1/rumi-app-api",
+  "checks": [
+    {
+      "path": "/health",
+      "expected_status": 200,
+      "actual_status": 200
+    },
+    {
+      "path": "/v1/config",
+      "expected_status": 200,
+      "actual_status": 200
+    },
+    {
+      "path": "/v1/me",
+      "expected_status": 401,
+      "actual_status": 401
+    },
+    {
+      "path": "/v1/context",
+      "expected_status": 401,
+      "actual_status": 401
+    },
+    {
+      "path": "/v1/memory",
+      "expected_status": 401,
+      "actual_status": 401
+    },
+    {
+      "path": "/v1/goals",
+      "expected_status": 401,
+      "actual_status": 401
+    },
+    {
+      "path": "/v1/records",
+      "expected_status": 401,
+      "actual_status": 401
+    },
+    {
+      "path": "/v1/conversations",
+      "expected_status": 401,
+      "actual_status": 401
+    },
+    {
+      "path": "/v1/me",
+      "expected_status": 401,
+      "actual_status": 401
+    }
+  ],
+  "authenticated_acceptance": "not performed",
+  "mutations_sent": false,
+  "supabase_servers": [
+    {
+      "url": "http://egoicdonmuudwvbsockm.supabase.co/rumi-app-api"
+    }
+  ]
+}

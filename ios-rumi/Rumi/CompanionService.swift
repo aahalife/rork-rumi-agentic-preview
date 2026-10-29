@@ -129,6 +129,10 @@ struct CompanionAccountView: View {
                 }
             }
             if let error { Section { Text(error).foregroundStyle(.red) } }
+            Section("Existing backend · New App API") {
+                NavigationLink("Rumi App API · Verified account") { RumiAppAPIView() }
+                Text("Use the published App API contract with its own public app ID and verified user session. Demo mode never calls these routes.").font(.footnote)
+            }
             Section {
                 NavigationLink("Calls & iMessage") { CompanionChannelsView() }
                 if connection.connected { Button("Disconnect this device", role: .destructive) { showDisconnect = true } }

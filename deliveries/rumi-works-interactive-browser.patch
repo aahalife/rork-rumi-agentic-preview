@@ -198,7 +198,7 @@ diff --git a/ios-rumi/Rumi/DemoMode.swift b/ios-rumi/Rumi/DemoMode.swift
 new file mode 100644
 --- /dev/null
 +++ b/ios-rumi/Rumi/DemoMode.swift
-@@ -0,0 +1,543 @@
+@@ -0,0 +1,564 @@
 +import SwiftUI
 +import Charts
 +import AVFoundation
@@ -225,6 +225,8 @@ new file mode 100644
 +    var role: String
 +    var text: String
 +    var kind: String = "conversation"
++    var insights: [DemoInsight]?
++    var invitesGoal: Bool?
 +}
 +enum DemoTimeline {
 +    static func date(daysAgo: Int) -> Date { Calendar.current.date(byAdding: .day, value: -daysAgo, to: DemoSession.shared.state.anchorDate ?? Calendar.current.startOfDay(for: Date()))! }
@@ -265,6 +267,7 @@ new file mode 100644
 +    var member: DemoMember = .primary
 +    var revision = UUID()
 +    var busy = false
++    var progress = "Rumi is thinking…"
 +    var error: String?
 +    var pendingGoal: String?
 +    var showTrends = false
@@ -332,7 +335,8 @@ new file mode 100644
 +        \(state.remembering ? "Authorized local demo goals: " + state.goals.joined(separator: "; ") : "")
 +        Demo cart: \(state.cart.joined(separator: "; ")). \(state.remembering ? "Authorized local demo receipts: " + state.receipts.prefix(8).map(\.text).joined(separator: "; ") : "No prior receipt recall is authorized.")
 +        Mock service state: saved seeded recipes \(state.mockSavedRecipes?.joined(separator: "; ") ?? "none"); ride rehearsal \(state.mockRideReceipt ?? "none"). Simulation data, not real service history.
-+        Available UI proposal tools: propose_goal, show_health, propose_groceries, show_demo_services. They do not execute changes. Other tools named in the supplied prompt are NOT installed. Never invent their results.
++        INSIGHTS POLICY (overrides conflicting instructions): Describe, never assess clinical values. Do not call a reading good/bad, healthy/unhealthy, normal/abnormal, better/worse or on target. Do not infer causes or patterns between measures. Do not invent ranges, targets, percentiles or comparison populations. For explicit requests to show/latest/last-N/trend/compare data, use read_demo_insights; the host computes facts and inline charts, not the model. Bundle multiple requests in its requests array; each retains its own dates and units. Primary has HbA1c/LDL-C/eGFR only; Maria HbA1c/Weight; Tom HbA1c/Weight/Sleep/Activity. Missing BMI, CGM, time-in-range and cohort datasets stay unavailable. Primary dates are illustrative. A1c change uses percentage points. Never look up a number merely mentioned in goal talk or a CGM device problem. Do not retract available sample data. No unsolicited tips: first ask an open question about the person's chosen goal after they accept an invitation. Plain answers to your questions are not requests for advice. Medication, refill, referral and lab-order actions remain reviewed local rehearsals, not live actions.
++        Available tools: read_demo_insights (read-only calculated facts), propose_goal, show_health, propose_groceries, show_demo_services (UI proposals only). Other tools named in the supplied prompt are NOT installed. Never invent their results.
 +        Local date: \(Date().formatted(date: .complete, time: .omitted)). Any selected future story event is fictional, not actual current treatment.
 +        """
 +    }
@@ -346,11 +350,16 @@ new file mode 100644
 +        guard !text.isEmpty, !busy else { return }
 +        guard promptAvailable else { error = "The supplied agent prompt is missing from this build. Demo AI is unavailable; no replacement prompt was used."; return }
 +        guard text.count <= 6000 else { error = "Please keep messages under 6,000 characters."; return }
++        let acceptsInvitation = state.messages.last?.invitesGoal == true && ["yes", "yes please", "sure", "okay", "ok"].contains(text.lowercased().trimmingCharacters(in: .punctuationCharacters))
 +        stop(); error = nil
 +        update { $0.messages.append(DemoTurn(role: "user", text: text)) }
-+        busy = true
++        if acceptsInvitation {
++            update { $0.messages.append(DemoTurn(role: "assistant", text: "What would you like to work toward, in your own words?", kind: "host-coaching")) }
++            return
++        }
++        busy = true; progress = DemoInsightEngine.isExplicitDataRequest(text) ? "Reading your request · Sonnet 5.5…" : "Rumi is thinking…"
 +        let version = revision, selected = member
-+        let history = state.messages.filter { $0.kind == "conversation" }.suffix(24)
++        let history = state.messages.filter { $0.kind != "voice" }.suffix(24)
 +        let instructions = instructions
 +        task = Task { [weak self] in
 +            do {
@@ -360,26 +369,42 @@ new file mode 100644
 +                request.setValue("Bearer \(DemoToolkit.accessKey)", forHTTPHeaderField: "Authorization")
 +                request.setValue("application/json", forHTTPHeaderField: "Content-Type")
 +                let tools: [[String: Any]] = [
++                    DemoInsightEngine.tool,
 +                    ["type": "function", "function": ["name": "propose_goal", "description": "Propose a nonclinical goal for native review. Does not save it.", "parameters": ["type": "object", "properties": ["text": ["type": "string"]], "required": ["text"], "additionalProperties": false]]],
 +                    ["type": "function", "function": ["name": "show_health", "description": "Offer the matching synthetic trend. Sleep and Activity are available for Tom only.", "parameters": ["type": "object", "properties": ["metric": ["type": "string", "enum": ["HbA1c", "Weight", "Sleep", "Activity", "LDL-C", "eGFR"]]], "required": ["metric"], "additionalProperties": false]]],
 +                    ["type": "function", "function": ["name": "show_demo_services", "description": "Open labelled local Instagram, Instacart and Uber simulations; no external actions.", "parameters": ["type": "object", "properties": [:]]]],
 +                    ["type": "function", "function": ["name": "propose_groceries", "description": "Offer the demo grocery review. No merchant changes.", "parameters": ["type": "object", "properties": [:]]]]
 +                ]
-+                request.httpBody = try JSONSerialization.data(withJSONObject: ["model": "anthropic/claude-sonnet-5.5", "messages": [["role": "system", "content": instructions]] + history.map { ["role": $0.role, "content": $0.text] }, "max_tokens": 1200, "tools": tools])
++                var payload: [String: Any] = ["model": "anthropic/claude-sonnet-5.5", "messages": [["role": "system", "content": instructions]] + history.map { ["role": $0.role, "content": $0.text + (($0.insights ?? []).isEmpty ? "" : "\nApp-calculated sample facts:\n" + ($0.insights ?? []).map(\.facts).joined(separator: "\n"))] }, "max_tokens": 1600, "tools": tools]
++                if DemoInsightEngine.isExplicitDataRequest(text) { payload["tool_choice"] = ["type": "function", "function": ["name": "read_demo_insights"]] }
++                request.httpBody = try JSONSerialization.data(withJSONObject: payload)
 +                let (data, response) = try await URLSession.shared.data(for: request)
 +                try Task.checkCancellation()
 +                guard let response = response as? HTTPURLResponse, (200...299).contains(response.statusCode) else { throw CompanionError(message: "Sonnet 5.5 could not complete this request. No fallback was used. Please try again later.") }
 +                let decoded = try JSONDecoder().decode(DemoAIReply.self, from: data)
 +                guard let reply = decoded.choices.first?.message else { throw CompanionError(message: "The AI returned no reply.") }
 +                guard let self, self.revision == version, self.member == selected else { return }
++                let insightCalls = (reply.tool_calls ?? []).filter { $0.function.name == "read_demo_insights" }
++                if DemoInsightEngine.isExplicitDataRequest(text), insightCalls.isEmpty { throw CompanionError(message: "Sonnet 5.5 did not return the required read-only insight query. No unverified numerical reply was displayed.") }
++                if !insightCalls.isEmpty {
++                    guard DemoInsightEngine.isExplicitDataRequest(text), insightCalls.count == 1 else { throw CompanionError(message: "No data lookup was performed. Please explicitly ask to show a trend, latest value or comparison.") }
++                    self.progress = "Calculating sample facts & building charts…"
++                    let queries = try DemoInsightEngine.parseQueries(insightCalls[0].function.arguments)
++                    let anchor = self.state.anchorDate ?? Calendar.current.startOfDay(for: Date())
++                    let insights = try queries.map { try DemoInsightEngine.evaluate($0, member: selected, anchor: anchor) }
++                    // Model narration is deliberately not published alongside numerical results.
++                    // Chart labels and numerical sentences come solely from the deterministic engine.
++                    self.update { $0.messages.append(DemoTurn(role: "assistant", text: "Here are the available sample facts. Would you like to talk about a goal that matters to you?", kind: "calculated-insight", insights: insights, invitesGoal: true)) }
++                    self.busy = false
++                    return
++                }
 +                if let content = reply.content, !content.isEmpty { self.update { $0.messages.append(DemoTurn(role: "assistant", text: content)) } }
 +                for call in reply.tool_calls ?? [] {
 +                    switch call.function.name {
 +                    case "propose_goal":
 +                        if let data = call.function.arguments.data(using: .utf8), let object = try? JSONSerialization.jsonObject(with: data) as? [String: String], let goal = object["text"], !goal.isEmpty { self.pendingGoal = String(goal.prefix(500)) }
 +                    case "show_health":
-+                        if let data = call.function.arguments.data(using: .utf8), let object = try? JSONSerialization.jsonObject(with: data) as? [String: String], let metric = object["metric"], (selected == .primary ? ["HbA1c", "LDL-C", "eGFR"] : selected == .tom ? ["HbA1c", "Weight", "Sleep", "Activity"] : ["HbA1c", "Weight"]).contains(metric) { self.requestedMetric = metric }
-+                        self.showTrends = true
++                        if let data = call.function.arguments.data(using: .utf8), let object = try? JSONSerialization.jsonObject(with: data) as? [String: String], let metric = object["metric"], DemoMetric.available(for: selected).map(\.rawValue).contains(metric) { self.requestedMetric = metric; self.showTrends = true }
 +                    case "propose_groceries": self.showGroceries = true
 +                    case "show_demo_services": self.showServices = true
 +                    default: break
@@ -424,10 +449,10 @@ new file mode 100644
 +                                VStack(alignment: .leading, spacing: 5) { Text(member.name).font(.title3.bold()); Text(member == .primary ? member.subtitle + " · Age not supplied" : "Age \(member.age.map(String.init) ?? "Not supplied") · \(member.subtitle)").font(.body) }
 +                                Spacer(); Image(systemName: selected == member ? "checkmark.circle.fill" : "circle").font(.title2)
 +                            }.padding(18).background(.white.opacity(selected == member ? 0.9 : 0.4), in: RoundedRectangle(cornerRadius: 24))
-+                        }.buttonStyle(.plain).foregroundStyle(Color.brandPrimary).accessibilityAddTraits(selected == member ? .isSelected : [])
++                        }.buttonStyle(.plain).foregroundStyle(Color.brandPrimary).accessibilityIdentifier("demo.member.\(member.rawValue)").accessibilityAddTraits(selected == member ? .isSelected : [])
 +                    }
 +                    Label("Fictional records stay separate from real care.", systemImage: "lock.shield").font(.callout)
-+                    Button("Start demo with \(selected.name.components(separatedBy: " ")[0])") { DemoSession.shared.select(selected); started = true }.buttonStyle(.borderedProminent).controlSize(.large).tint(Color.brandPrimary).frame(maxWidth: .infinity)
++                    Button("Start demo with \(selected.name.components(separatedBy: " ")[0])") { DemoSession.shared.select(selected); started = true }.buttonStyle(.borderedProminent).controlSize(.large).tint(Color.brandPrimary).frame(maxWidth: .infinity).accessibilityIdentifier("demo.start")
 +                    Text("Messages and microphone audio are processed by AI providers. Please don’t enter real patient information in this demo.").font(.footnote).foregroundStyle(.secondary)
 +                }.padding(24)
 +            }.background { AmbientBackground() }.toolbar { ToolbarItem(placement: .topBarTrailing) { Button("Close") { DemoSession.shared.isPresented = false; dismiss() }.frame(minHeight: 44) } }
@@ -468,17 +493,22 @@ new file mode 100644
 +                            }
 +                            ForEach(demo.state.messages) { turn in
 +                                VStack(alignment: .leading, spacing: 6) {
-+                                    Text(turn.role == "user" ? "You" : "Rumi · Live AI").font(.caption.bold()).foregroundStyle(.secondary)
++                                    Text(turn.role == "user" ? "You" : turn.kind == "calculated-insight" ? "Rumi · Sonnet-selected query · App-calculated facts" : turn.kind == "host-coaching" ? "Rumi · Guided next step" : "Rumi · Live AI").font(.caption.bold()).foregroundStyle(.secondary)
++                                    ForEach(turn.insights ?? []) { insight in DemoInsightCard(insight: insight) }
 +                                    Text(turn.text).font(.body).textSelection(.enabled)
++                                    if turn.invitesGoal == true, demo.state.messages.last?.id == turn.id {
++                                        Button("Yes, talk about my goal") { demo.send("Yes") }.buttonStyle(.bordered).frame(minHeight: 44).disabled(demo.busy)
++                                    }
 +                                }.padding(16).frame(maxWidth: .infinity, alignment: .leading).background(turn.role == "user" ? Color.brandPrimary.opacity(0.08) : .white.opacity(0.65), in: RoundedRectangle(cornerRadius: 20))
 +                            }
-+                            if demo.busy { HStack { ProgressView(); Text("Rumi is thinking…"); Spacer(); Button("Stop") { demo.stop() }.frame(minHeight: 44) } }
++                            if demo.busy { HStack { ProgressView(); Text(demo.progress); Spacer(); Button("Stop") { demo.stop() }.frame(minHeight: 44) } }
 +                            if let error = demo.error { Text(error).foregroundStyle(.red).font(.callout) }
 +                            if let proposed = demo.pendingGoal { Button("Review proposed goal: \(proposed)") { reviewedGoal = proposed }.buttonStyle(.bordered).frame(minHeight: 44) }
 +                            VStack(alignment: .leading, spacing: 4) {
 +                                if demo.member == .primary {
 +                                    suggestion("Review my repeat labs with Rumi", icon: "bubble.left") { demo.send("Using the supplied fictional profile, help prepare PCP questions about A1c 9.0 to 8.8%, LDL-C 130 to 130 mg/dL and eGFR 60 to 55 mL/min/1.73 m². Do not recommend medication changes.") }
 +                                }
++                                suggestion("Insights walkthrough · Charts in chat", icon: "chart.bar.xaxis") { path.append("insights") }.accessibilityIdentifier("demo.insights.walkthrough")
 +                                suggestion("Demo services · Instagram, Instacart & Uber", icon: "rectangle.on.rectangle") { path.append("services") }
 +                                if demo.member != .primary { suggestion(demo.member == .maria ? "Is my A1c change progress?" : "Help me fit a walk into a busy day", icon: "bubble.left") { demo.send(demo.member == .maria ? "My sample A1c is 7.8%, down from 8.6%. Help me understand the change and prepare a question for my care team." : "I can manage a short lunch walk but not a whole workout. Help me find a manageable next step.") } }
 +                                suggestion("Explore health & care story", icon: "chart.xyaxis.line") { path.append("health") }
@@ -502,7 +532,7 @@ new file mode 100644
 +                }.padding(.horizontal, 16).padding(.vertical, 10).background(.regularMaterial)
 +            }
 +            .navigationDestination(for: String.self) { page in
-+                switch page { case "services": DemoServicesView(); case "browser": DemoBrowserView(); case "health": DemoHealthView(initialMetric: demo.requestedMetric); case "groceries": DemoGroceriesView(); case "goals": goalsView; default: DemoOutreachView() }
++                switch page { case "insights": DemoInsightsWalkthrough(); case "services": DemoServicesView(); case "browser": DemoBrowserView(); case "health": DemoHealthView(initialMetric: demo.requestedMetric); case "groceries": DemoGroceriesView(); case "goals": goalsView; default: DemoOutreachView() }
 +            }
 +            .sheet(isPresented: $voice) { DemoVoiceView() }
 +            .sheet(item: Binding(get: { reviewedGoal.map { DemoGoalReview(text: $0) } }, set: { reviewedGoal = $0?.text })) { review in
@@ -549,19 +579,10 @@ new file mode 100644
 +    private var unit: String { switch metric { case "Weight": "lb"; case "Sleep": "hours"; case "Activity": "steps"; case "LDL-C": "mg/dL"; case "eGFR": "mL/min/1.73 m²"; default: "%" } }
 +    private func date(_ days: Int) -> Date { DemoTimeline.date(daysAgo: days) }
 +    private var points: [DemoPoint] {
-+        let maria = demo.member == .maria
-+        let all: [DemoPoint]
-+        if demo.member == .primary {
-+            let values: [Double] = metric == "LDL-C" ? [130, 130] : metric == "eGFR" ? [60, 55] : [9.0, 8.8]
-+            return zip([270, 70], values).map { DemoPoint(date: date($0.0), value: $0.1) }.filter { days == 0 || $0.date >= date(days) }
-+        }
-+        switch metric {
-+        case "Weight": all = zip([92, 60, 30, 0], maria ? [216.7, 214.2, 211.4, 208.7] : [228, 226.5, 225.8, 224]).map { DemoPoint(date: date($0.0), value: $0.1) }
-+        case "Sleep": all = (0..<14).map { DemoPoint(date: date(13 - $0), value: 6.4 + [0.2, -0.4, 0.5, -0.1, -0.3, 0.1, 0.0][$0 % 7]) }
-+        case "Activity": all = (0..<14).map { DemoPoint(date: date(13 - $0), value: Double(4800 + [400, -600, 800, -300, -400, 100, 0][$0 % 7])) }
-+        default: all = maria ? [DemoPoint(date: date(92), value: 8.6), DemoPoint(date: date(50), value: 8.2), DemoPoint(date: date(0), value: 7.8)] : [DemoPoint(date: date(0), value: 5.8)]
-+        }
-+        return all.filter { days == 0 || $0.date >= date(days) }
++        guard let selectedMetric = DemoMetric(rawValue: metric) else { return [] }
++        let anchor = demo.state.anchorDate ?? Calendar.current.startOfDay(for: Date())
++        return DemoInsightEngine.observations(member: demo.member, metric: selectedMetric, anchor: anchor)
++            .filter { days == 0 || $0.date >= date(days) }.map { DemoPoint(date: $0.date, value: $0.value) }
 +    }
 +    private var highlighted: DemoPoint? { guard let selected else { return points.last }; return points.min { abs($0.date.timeIntervalSince(selected)) < abs($1.date.timeIntervalSince(selected)) } }
 +    var body: some View {
@@ -742,6 +763,1226 @@ new file mode 100644
 +        .onReceive(NotificationCenter.default.publisher(for: AVAudioSession.interruptionNotification)) { _ in voice.stop() }
 +    }
 +}
+diff --git a/ios-rumi/Rumi/DemoInsights.swift b/ios-rumi/Rumi/DemoInsights.swift
+new file mode 100644
+--- /dev/null
++++ b/ios-rumi/Rumi/DemoInsights.swift
+@@ -0,0 +1,275 @@
++import SwiftUI
++import Charts
++
++// The model selects queries. Only this repository supplies numbers, dates and chart points.
++enum DemoMetric: String, Codable, CaseIterable, Identifiable {
++    case a1c = "HbA1c", ldl = "LDL-C", egfr = "eGFR", weight = "Weight"
++    case sleep = "Sleep", steps = "Activity", bmi = "BMI", glucose = "CGM glucose", tir = "Time in range"
++    var id: String { rawValue }
++    var unit: String {
++        switch self {
++        case .a1c, .tir: "%"
++        case .ldl, .glucose: "mg/dL"
++        case .egfr: "mL/min/1.73 m²"
++        case .weight: "lb"
++        case .sleep: "hours"
++        case .steps: "steps"
++        case .bmi: "kg/m²"
++        }
++    }
++    static func available(for member: DemoMember) -> [Self] {
++        switch member { case .primary: [.a1c, .ldl, .egfr]; case .maria: [.a1c, .weight]; case .tom: [.a1c, .weight, .sleep, .steps] }
++    }
++}
++
++struct DemoInsightObservation: Codable, Identifiable, Equatable {
++    let date: Date
++    let value: Double
++    var id: Date { date }
++}
++
++struct DemoInsightQuery: Codable, Equatable {
++    enum Operation: String, Codable { case latest, trend, lastN, sideBySide, cohort, timeInRange }
++    let operation: Operation
++    let metrics: [DemoMetric]
++    let days: Int?
++    let count: Int?
++    func validate() throws {
++        guard (1...2).contains(metrics.count), Set(metrics).count == metrics.count,
++              days == nil || (1...3650).contains(days!), count == nil || (1...20).contains(count!),
++              (operation == .sideBySide ? metrics.count == 2 : metrics.count == 1),
++              (operation != .lastN || count != nil),
++              (operation != .timeInRange || metrics == [.tir]) else {
++            throw CompanionError(message: "The insight request was not valid. Ask for one measure, or two side by side.")
++        }
++    }
++}
++
++struct DemoInsightSeries: Codable, Identifiable {
++    var id: String { metric.rawValue }
++    let metric: DemoMetric
++    let observations: [DemoInsightObservation]
++    let facts: [String]
++    let limitation: String
++}
++
++struct DemoInsight: Codable, Identifiable {
++    var id = UUID()
++    let member: DemoMember
++    let query: DemoInsightQuery
++    let series: [DemoInsightSeries]
++    let baseline: Date
++    var title: String { query.operation == .sideBySide ? "Side by side · Not a relationship" : query.operation == .cohort ? "Comparison data unavailable" : "Your sample numbers" }
++    var facts: String { series.flatMap(\.facts).joined(separator: "\n") }
++}
++
++enum DemoInsightEngine {
++    static func observations(member: DemoMember, metric: DemoMetric, anchor: Date) -> [DemoInsightObservation] {
++        guard DemoMetric.available(for: member).contains(metric) else { return [] }
++        let offsets: [Int], values: [Double]
++        if member == .primary {
++            offsets = [270, 70]
++            values = metric == .ldl ? [130, 130] : metric == .egfr ? [60, 55] : [9, 8.8]
++        } else {
++            switch metric {
++            case .weight:
++                offsets = [92, 60, 30, 0]; values = member == .maria ? [216.7, 214.2, 211.4, 208.7] : [228, 226.5, 225.8, 224]
++            case .sleep:
++                offsets = (0..<14).map { 13 - $0 }; values = (0..<14).map { 6.4 + [0.2, -0.4, 0.5, -0.1, -0.3, 0.1, 0.0][$0 % 7] }
++            case .steps:
++                offsets = (0..<14).map { 13 - $0 }; values = (0..<14).map { Double(4800 + [400, -600, 800, -300, -400, 100, 0][$0 % 7]) }
++            default:
++                offsets = member == .maria ? [92, 50, 0] : [0]; values = member == .maria ? [8.6, 8.2, 7.8] : [5.8]
++            }
++        }
++        return zip(offsets, values).compactMap { offset, value in
++            Calendar.current.date(byAdding: .day, value: -offset, to: anchor).map { DemoInsightObservation(date: $0, value: value) }
++        }.sorted { $0.date < $1.date }
++    }
++    static func number(_ value: Double) -> String { value.formatted(.number.precision(.fractionLength(0...2))) }
++    static func evaluate(_ query: DemoInsightQuery, member: DemoMember, anchor: Date) throws -> DemoInsight {
++        try query.validate()
++        let series = query.metrics.map { metric -> DemoInsightSeries in
++            if query.operation == .cohort {
++                return DemoInsightSeries(metric: metric, observations: [], facts: ["No validated comparison dataset is installed for this demo."], limitation: "No percentile, peer average or demographic match was inferred.")
++            }
++            if query.operation == .timeInRange || metric == .tir {
++                return DemoInsightSeries(metric: metric, observations: [], facts: ["No CGM readings or coverage interval are available to calculate time in range."], limitation: "No target or synthetic percentage was substituted.")
++            }
++            var points = observations(member: member, metric: metric, anchor: anchor)
++            if let days = query.days, let start = Calendar.current.date(byAdding: .day, value: -days, to: anchor) { points = points.filter { $0.date >= start && $0.date <= anchor } }
++            let available = points.count
++            if query.operation == .latest { points = Array(points.suffix(1)) }
++            if query.operation == .lastN { points = Array(points.suffix(query.count ?? 4)) }
++            guard !points.isEmpty else {
++                return DemoInsightSeries(metric: metric, observations: [], facts: ["No \(metric.rawValue) observations are available for this member in the requested period."], limitation: "Missing observations are not zeros. Try All or choose another measure; BMI requires height and weight, and CGM requires actual readings.")
++            }
++            let facts = points.map { point in
++                let label = member == .primary ? (point == observations(member: member, metric: metric, anchor: anchor).first ? "Earlier supplied result" : "Repeat supplied result") : point.date.formatted(date: .abbreviated, time: .omitted)
++                return "\(metric.rawValue): \(number(point.value)) \(metric.unit) · \(label)."
++            }
++            var descriptions = facts
++            if query.operation != .latest, let first = points.first, let last = points.last, points.count > 1 {
++                let delta = last.value - first.value
++                let unit = metric == .a1c || metric == .tir ? "percentage points" : metric.unit
++                descriptions.append(delta == 0 ? "First-to-last change: unchanged." : "First-to-last change: \(delta > 0 ? "+" : "")\(number(delta)) \(unit).")
++            }
++            var limitation = member == .primary ? "Supplied fictional scenario. Dates on this chart are illustrative, not actual lab dates." : "Fictional sample observations. Dates are anchored to the saved demo baseline; intermediate weights are synthetic."
++            if query.operation == .lastN, available < (query.count ?? 4) { limitation += " Only \(available) results are available, fewer than requested." }
++            limitation += " No lab reference ranges were supplied. No clinical assessment or cause is inferred."
++            return DemoInsightSeries(metric: metric, observations: points, facts: descriptions, limitation: limitation)
++        }
++        return DemoInsight(member: member, query: query, series: series, baseline: anchor)
++    }
++    // Conservative intent gate: a mention or a worried number alone never starts a lookup.
++    static func isExplicitDataRequest(_ text: String) -> Bool {
++        let intent = text.range(of: "(?i)\\b(show|plot|chart|compare|comparison|latest|last \\d+|trend|over time|over (?:the last )?\\d+ (?:days|weeks|months|years)|side by side|time in range|how many|what (?:is|was|are|were)|review my (?:repeat )?labs)\\b", options: .regularExpression) != nil
++        let measure = text.range(of: "(?i)\\b(a1cs?|hba1cs?|ldl|egfr|weight|bmi|sleep|steps|activity|glucose|cgm|labs|time in range)\\b", options: .regularExpression) != nil
++        let urgent = text.range(of: "(?i)\\b(chest pain|can.t breathe|fainting|unconscious|seizure|low (?:blood )?(?:glucose|sugar)|suicid|kill myself)\\b", options: .regularExpression) != nil
++        return intent && measure && !urgent
++    }
++    static func parseQueries(_ arguments: String) throws -> [DemoInsightQuery] {
++        guard let data = arguments.data(using: .utf8), let object = try JSONSerialization.jsonObject(with: data) as? [String: Any], Set(object.keys) == ["requests"],
++              let rows = object["requests"] as? [[String: Any]], (1...4).contains(rows.count),
++              rows.allSatisfy({ Set($0.keys).isSubset(of: ["operation", "metrics", "days", "count"]) }) else { throw CompanionError(message: "The model returned an invalid insight request; no chart was created.") }
++        struct Envelope: Decodable { let requests: [DemoInsightQuery] }
++        let queries = try JSONDecoder().decode(Envelope.self, from: data).requests
++        try queries.forEach { try $0.validate() }
++        return queries
++    }
++    static var tool: [String: Any] {
++        ["type": "function", "function": ["name": "read_demo_insights", "description": "Read-only deterministic fictional-member facts and inline charts. For explicit data requests only, not mentions in coaching. Bundle up to four requests. Never supply numbers, dates, patient IDs or diagnoses. Use sideBySide for exactly two measures; others use one. Missing and cohort data return honest unavailable cards.", "parameters": ["type": "object", "properties": ["requests": ["type": "array", "minItems": 1, "maxItems": 4, "items": ["type": "object", "properties": ["operation": ["type": "string", "enum": ["latest", "trend", "lastN", "sideBySide", "cohort", "timeInRange"]], "metrics": ["type": "array", "items": ["type": "string", "enum": DemoMetric.allCases.map(\.rawValue)], "minItems": 1, "maxItems": 2], "days": ["type": "integer", "minimum": 1, "maximum": 3650], "count": ["type": "integer", "minimum": 1, "maximum": 20]], "required": ["operation", "metrics"], "additionalProperties": false]]], "required": ["requests"], "additionalProperties": false]]]
++    }
++}
++
++struct DemoInsightCard: View {
++    let insight: DemoInsight
++    var body: some View {
++        VStack(alignment: .leading, spacing: 16) {
++            Label(insight.title, systemImage: "chart.xyaxis.line").font(.title3.bold())
++            Text("Demo · \(insight.member.name) · Calculated facts").font(.caption.weight(.semibold)).foregroundStyle(.secondary)
++            Text(insight.query.days.map { "Requested period: last \($0) days" } ?? "Requested period: all available sample dates").font(.footnote)
++            ForEach(insight.series) { series in DemoInsightSeriesView(series: series, baseline: insight.baseline) }
++            if insight.series.count == 2 { Text("Each series retains its own dates and unit. No correlation or causal relationship is calculated.").font(.footnote) }
++        }.padding(18).frame(maxWidth: .infinity, alignment: .leading)
++            .background(.white.opacity(0.9), in: RoundedRectangle(cornerRadius: 24))
++            .overlay { RoundedRectangle(cornerRadius: 24).stroke(Color.brandPrimary.opacity(0.18)) }
++            .accessibilityElement(children: .contain)
++            .accessibilityIdentifier("demo.insight.card")
++    }
++}
++
++private struct DemoInsightSeriesView: View {
++    let series: DemoInsightSeries
++    let baseline: Date
++    @State private var selected: Date?
++    @State private var range = 0
++    private var points: [DemoInsightObservation] {
++        guard range > 0, let start = Calendar.current.date(byAdding: .day, value: -range, to: baseline) else { return series.observations }
++        return series.observations.filter { $0.date >= start }
++    }
++    private var focused: DemoInsightObservation? {
++        guard let selected else { return points.last }
++        return points.min { abs($0.date.timeIntervalSince(selected)) < abs($1.date.timeIntervalSince(selected)) }
++    }
++    var body: some View {
++        VStack(alignment: .leading, spacing: 12) {
++            Text(series.metric.rawValue).font(.headline)
++            if !series.observations.isEmpty {
++                Picker("Visible chart range for \(series.metric.rawValue)", selection: $range) { Text("30d").tag(30); Text("90d").tag(90); Text("All").tag(0) }.pickerStyle(.segmented)
++                if points.isEmpty { Text("No observations in this window. Select All to see the requested sample results.").font(.callout) }
++            }
++            if let point = focused {
++                Text("\(DemoInsightEngine.number(point.value)) \(series.metric.unit)").font(.title2.bold()).foregroundStyle(Color.brandPrimary).accessibilityIdentifier("demo.insight.focused")
++                Text("Illustrative sample date · \(point.date.formatted(date: .abbreviated, time: .omitted))").font(.caption)
++                Chart(points) { point in
++                    if points.count > 1 { LineMark(x: .value("Sample date", point.date), y: .value(series.metric.unit, point.value)).foregroundStyle(Color.brandPrimary) }
++                    PointMark(x: .value("Sample date", point.date), y: .value(series.metric.unit, point.value)).foregroundStyle(Color.brandPrimary)
++                        .accessibilityLabel("\(series.metric.rawValue), illustrative date \(point.date.formatted(date: .abbreviated, time: .omitted))")
++                        .accessibilityValue("\(DemoInsightEngine.number(point.value)) \(series.metric.unit)")
++                }.frame(height: 170).chartXSelection(value: $selected).chartYAxisLabel(series.metric.unit)
++                Text("Drag to inspect · \(points.count) observations. Lines only connect sample points.").font(.caption).foregroundStyle(.secondary)
++            }
++            ForEach(Array(series.facts.enumerated()), id: \.offset) { _, fact in Text(fact).font(.callout).textSelection(.enabled) }
++            Text(series.limitation).font(.footnote).foregroundStyle(.secondary)
++            if !points.isEmpty {
++                DisclosureGroup("Accessible values & sample dates") {
++                    ForEach(points) { point in LabeledContent(point.date.formatted(date: .abbreviated, time: .omitted), value: "\(DemoInsightEngine.number(point.value)) \(series.metric.unit)").padding(.vertical, 4) }
++                }.accessibilityIdentifier("demo.insight.values")
++            }
++        }.accessibilityElement(children: .contain).onChange(of: range) { _, _ in selected = nil }
++    }
++}
++
++struct DemoInsightsWalkthrough: View {
++    @Environment(\.dismiss) private var dismiss
++    @State private var demo = DemoSession.shared
++    var body: some View {
++        List {
++            Section {
++                Text("Numbers first. Your next step, only if you want.").font(.title2.bold())
++                Text("Sonnet 5.5 selects read-only queries. The app calculates facts and builds charts from this fictional member’s records. No lab assessment, diagnosis or medication changes.")
++            }
++            Section("Ask Rumi · Live Sonnet 5.5") {
++                example("My numbers over time", demo.member == .primary ? "Show my A1c and eGFR side by side, and also my latest LDL." : demo.member == .maria ? "Show my A1c and weight side by side." : "Show my steps and sleep side by side over the last 14 days.")
++                example("My last four results", "Show my last 4 A1c results. If fewer exist, show only those available.")
++                example("An honest missing-data answer", "Compare my A1c with people like me and show my CGM time in range.")
++                Text("These buttons send a real request, not a scripted AI answer. Cards contain locally calculated sample facts.").font(.footnote)
++            }
++            Section("Calculated preview · No AI request") {
++                if let preview = try? DemoInsightEngine.evaluate(DemoInsightQuery(operation: .trend, metrics: [.a1c], days: nil, count: nil), member: demo.member, anchor: demo.state.anchorDate ?? Calendar.current.startOfDay(for: Date())) { DemoInsightCard(insight: preview) }
++                Text("This preview is built by the app. Use the Ask Rumi buttons above to exercise live Sonnet query selection.").font(.footnote)
++            }
++            Section("Rehearse a follow-up · Not sent") {
++                NavigationLink("Refill, referral & lab follow-ups") { DemoCareFollowupsView() }.accessibilityIdentifier("demo.care.followups")
++                Text("Answer buttons are bound to an exact local question. No pharmacy, provider directory, calendar, lab booking or clinical record is changed.").font(.footnote)
++            }
++            Section("Coaching after the answer") {
++                Text("After a data answer, accept the next-step invitation to get one open question about your goal. A worried mention of a number stays in the conversation. Tips are offered only when you ask for ideas.")
++                Text("Peer comparisons, BMI and CGM are unavailable when required data is absent; the app does not invent them.")
++            }
++        }.navigationTitle("Insights walkthrough").demoLabel()
++    }
++    private func example(_ title: String, _ prompt: String) -> some View {
++        Button { demo.send(prompt); dismiss() } label: { VStack(alignment: .leading, spacing: 6) { Text(title).font(.headline); Text(prompt).font(.callout).foregroundStyle(.secondary) }.padding(.vertical, 8).frame(minHeight: 44) }.disabled(demo.busy)
++    }
++}
++
++struct DemoCareFollowupsView: View {
++    @State private var demo = DemoSession.shared
++    @State private var review: Review?
++    private struct Review: Identifiable { let id = UUID(); let member: DemoMember; let revision: UUID; let kind: String; let question: String; let answer: String }
++    var body: some View {
++        List {
++            Section { Text("Seeded follow-up rehearsals · These are not supplied active orders or actual reminder deliveries. Answers save a local receipt only; they never stop medication, make a referral or complete a lab order.").font(.callout) }
++            followup("Refill reminder", "Would you like to prepare a refill question for your prescriber?", ["Prepare a question", "Not now"])
++            followup("Specialist referral", "Would you like to rehearse asking your care team about a referral?", ["Prepare my questions", "Not now"])
++            followup("Lab follow-up", "Would you like to rehearse planning a blood draw?", ["Review planning steps", "Not now"])
++            Section("Local follow-up history") {
++                ForEach(demo.state.receipts.filter { $0.text.hasPrefix("Care rehearsal") }) { receipt in Text(receipt.text); Text(receipt.date.formatted()).font(.caption).foregroundStyle(.secondary) }
++            }
++        }.navigationTitle("Care follow-ups").demoLabel()
++            .sheet(item: $review) { item in
++                NavigationStack {
++                    Form {
++                        Section("Exact question") { Text(item.question) }
++                        Section("Your selected answer") { Text(item.answer); Text("\(item.member.name) · \(item.kind)") }
++                        Section {
++                            Button("Confirm local rehearsal · Not sent") {
++                                guard demo.member == item.member, demo.revision == item.revision else { review = nil; return }
++                                demo.receipt("Care rehearsal · \(item.kind) · Question: \(item.question) Answer: \(item.answer). Simulated · Not sent. No medication, referral, calendar or lab order changed.")
++                                review = nil
++                            }.disabled(demo.member != item.member || demo.revision != item.revision)
++                        } footer: { Text("No provider search was performed. No slots are available or booked. Calendar access is not requested. Labcorp is not loaded or automated.") }
++                    }.navigationTitle("Review rehearsal").toolbar { Button("Cancel") { review = nil } }
++                }
++            }
++            .onChange(of: demo.revision) { _, _ in review = nil }
++    }
++    private func followup(_ kind: String, _ question: String, _ answers: [String]) -> some View {
++        Section(kind) {
++            Text(question)
++            ForEach(answers, id: \.self) { answer in Button(answer) { review = Review(member: demo.member, revision: demo.revision, kind: kind, question: question, answer: answer) }.frame(minHeight: 44) }
++        }
++    }
++}
+diff --git a/ios-rumi/Rumi/RumiAppAPI.swift b/ios-rumi/Rumi/RumiAppAPI.swift
+new file mode 100644
+--- /dev/null
++++ b/ios-rumi/Rumi/RumiAppAPI.swift
+@@ -0,0 +1,222 @@
++import Foundation
++import Security
++import SwiftUI
++
++private final class RumiAPINoRedirectDelegate: NSObject, URLSessionTaskDelegate, @unchecked Sendable {
++    nonisolated func urlSession(_ session: URLSession, task: URLSessionTask, willPerformHTTPRedirection response: HTTPURLResponse, newRequest request: URLRequest, completionHandler: @escaping (URLRequest?) -> Void) { completionHandler(nil) }
++}
++
++// Contract: integrations/rumi-app-api/openapi.json. Independent of demo and legacy Companion.
++struct RumiAPISettings: Codable, Equatable {
++    let baseURL: String
++    let appID: String
++    func validatedURL() throws -> URL {
++        guard let url = URL(string: baseURL), url.scheme == "https", url.host != nil,
++              url.user == nil, url.password == nil, url.query == nil, url.fragment == nil,
++              UUID(uuidString: appID) != nil else {
++            throw CompanionError(message: "Enter the confirmed HTTPS API base URL and public app ID. The documentation URL is not necessarily the API base URL.")
++        }
++        return url
++    }
++}
++struct RumiAPISession: Codable {
++    let user_id: String
++    let session_id: String
++    let access_token: String
++    let refresh_token: String
++    let expires_at: String
++    let refresh_expires_at: String?
++    var needsRefresh: Bool {
++        let formatter = ISO8601DateFormatter()
++        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
++        let date = formatter.date(from: expires_at) ?? ISO8601DateFormatter().date(from: expires_at)
++        return date == nil || date!.timeIntervalSinceNow < 60
++    }
++}
++struct RumiAPIChallenge: Decodable {
++    let challenge_id: String
++    let status: String
++    let delivered: Bool?
++    let expires_in: Int?
++    let messaging_number: String?
++}
++struct RumiAPIReceipt: Decodable {
++    let status: String?
++    let committed: Bool?
++    let receipt_id: String?
++    var confirmed: Bool { committed == true }
++}
++struct RumiAPIConfig: Decodable {
++    let api_version: String?
++    let records_mode: String?
++    let brand: String?
++}
++struct RumiAPIMemory: Decodable {
++    struct Item: Decodable, Identifiable {
++        struct Body: Decodable { let text: String? }
++        let id: String
++        let kind: String?
++        let status: String?
++        let body: Body?
++    }
++    let memory_consent: String?
++    let preferred_name: String?
++    let items: [Item]?
++}
++// Preserve loosely specified records/context without guessing their medical meaning or test/live mode.
++indirect enum RumiJSON: Codable {
++    case object([String: RumiJSON]), array([RumiJSON]), string(String), number(Double), bool(Bool), null
++    init(from decoder: Decoder) throws {
++        let c = try decoder.singleValueContainer()
++        if c.decodeNil() { self = .null }
++        else if let value = try? c.decode(Bool.self) { self = .bool(value) }
++        else if let value = try? c.decode(String.self) { self = .string(value) }
++        else if let value = try? c.decode(Double.self) { self = .number(value) }
++        else if let value = try? c.decode([String: RumiJSON].self) { self = .object(value) }
++        else { self = .array(try c.decode([RumiJSON].self)) }
++    }
++    func encode(to encoder: Encoder) throws {
++        var c = encoder.singleValueContainer()
++        switch self { case .object(let x): try c.encode(x); case .array(let x): try c.encode(x); case .string(let x): try c.encode(x); case .number(let x): try c.encode(x); case .bool(let x): try c.encode(x); case .null: try c.encodeNil() }
++    }
++    var formatted: String {
++        let encoder = JSONEncoder(); encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
++        return (try? encoder.encode(self)).flatMap { String(data: $0, encoding: .utf8) } ?? "Unavailable"
++    }
++}
++
++@MainActor @Observable
++final class RumiAppAPI {
++    static let shared = RumiAppAPI()
++    private(set) var settings: RumiAPISettings?
++    private(set) var authenticated = false
++    private(set) var identity = UUID()
++    private var session: RumiAPISession?
++    private var refreshTask: Task<RumiAPISession, Error>?
++    private let transport: URLSession
++    private let persist: Bool
++    private let settingsKey = "rumi.app-api.settings.v1"
++    private static let keychainService = "com.rumi.app-api.session.v1"
++    init(transport: URLSession? = nil, persist: Bool = true) {
++        let configuration = URLSessionConfiguration.ephemeral
++        configuration.urlCache = nil; configuration.httpCookieStorage = nil; configuration.httpShouldSetCookies = false
++        self.transport = transport ?? URLSession(configuration: configuration, delegate: RumiAPINoRedirectDelegate(), delegateQueue: nil); self.persist = persist
++        if persist, let data = UserDefaults.standard.data(forKey: settingsKey), let value = try? JSONDecoder().decode(RumiAPISettings.self, from: data), (try? value.validatedURL()) != nil {
++            settings = value
++            var item: CFTypeRef?
++            if SecItemCopyMatching([kSecClass as String: kSecClassGenericPassword, kSecAttrService as String: Self.keychainService, kSecAttrAccount as String: "session", kSecReturnData as String: true] as CFDictionary, &item) == errSecSuccess, let data = item as? Data {
++                session = try? JSONDecoder().decode(RumiAPISession.self, from: data); authenticated = session != nil
++            }
++        }
++    }
++    func configure(_ settings: RumiAPISettings) throws {
++        try allowed()
++        _ = try settings.validatedURL()
++        if self.settings != settings { disconnect(); self.settings = settings }
++        if persist { UserDefaults.standard.set(try JSONEncoder().encode(settings), forKey: settingsKey) }
++    }
++    func disconnect() {
++        refreshTask?.cancel(); refreshTask = nil; identity = UUID(); session = nil; authenticated = false
++        if persist { SecItemDelete([kSecClass as String: kSecClassGenericPassword, kSecAttrService as String: Self.keychainService] as CFDictionary) }
++    }
++    private func allowed() throws {
++        guard !DemoSession.shared.isPresented else { throw CompanionError(message: "Existing-account API requests are blocked while demo mode is open.") }
++    }
++    static func makeRequest(settings: RumiAPISettings, path: String, method: String = "GET", body: [String: String]? = nil, token: String? = nil, idempotencyKey: String? = nil) throws -> URLRequest {
++        guard path.hasPrefix("v1/") || path == "health", !path.contains(".."), !path.contains("?"), !path.contains("#"), !path.contains("://") else { throw CompanionError(message: "Unsupported API route.") }
++        let base = try settings.validatedURL()
++        var request = URLRequest(url: base.appendingPathComponent(path))
++        request.httpMethod = method; request.timeoutInterval = 30
++        request.setValue(settings.appID, forHTTPHeaderField: "x-rumi-app-id")
++        request.setValue("application/json", forHTTPHeaderField: "Accept")
++        if let token { request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization") }
++        if let idempotencyKey { request.setValue(idempotencyKey, forHTTPHeaderField: "Idempotency-Key") }
++        if let body { request.httpBody = try JSONSerialization.data(withJSONObject: body); request.setValue("application/json", forHTTPHeaderField: "Content-Type") }
++        return request
++    }
++    private func perform<T: Decodable>(_ path: String, method: String = "GET", body: [String: String]? = nil, token: String? = nil, idempotencyKey: String? = nil) async throws -> T {
++        try allowed()
++        guard let settings else { throw CompanionError(message: "The App API is not configured yet. Await the confirmed base URL and public app ID.") }
++        let version = identity
++        let request = try Self.makeRequest(settings: settings, path: path, method: method, body: body, token: token, idempotencyKey: idempotencyKey)
++        let (data, response) = try await transport.data(for: request)
++        try Task.checkCancellation(); try allowed()
++        guard identity == version else { throw CompanionError(message: "The API account changed. Reopen this screen.") }
++        guard let http = response as? HTTPURLResponse else { throw CompanionError(message: "No API response was received.") }
++        guard (200..<300).contains(http.statusCode) else {
++            // Do not expose raw bodies, tokens, signed URLs or provider messages.
++            throw CompanionError(message: http.statusCode == 401 ? "Your Rumi session is unavailable or expired. Sign in again." : http.statusCode == 429 ? "Rumi is rate limiting requests. Please wait before trying again." : "Rumi App API could not complete this request (HTTP \(http.statusCode)).")
++        }
++        guard data.count <= 2_000_000 else { throw CompanionError(message: "The API response exceeded this app’s safe size limit.") }
++        return try JSONDecoder().decode(T.self, from: data)
++    }
++    private func store(_ value: RumiAPISession) throws {
++        guard value.access_token.range(of: "^[a-f0-9]{64}$", options: .regularExpression) != nil,
++              value.refresh_token.range(of: "^[a-f0-9]{64}$", options: .regularExpression) != nil else { throw CompanionError(message: "Rumi returned an invalid session.") }
++        if persist {
++            let query: [String: Any] = [kSecClass as String: kSecClassGenericPassword, kSecAttrService as String: Self.keychainService, kSecAttrAccount as String: "session"]
++            let data = try JSONEncoder().encode(value)
++            let update = SecItemUpdate(query as CFDictionary, [kSecValueData as String: data] as CFDictionary)
++            if update == errSecItemNotFound {
++                var add = query; add[kSecValueData as String] = data; add[kSecAttrAccessible as String] = kSecAttrAccessibleWhenUnlockedThisDeviceOnly
++                guard SecItemAdd(add as CFDictionary, nil) == errSecSuccess else { throw CompanionError(message: "The Rumi session could not be saved securely.") }
++            } else if update != errSecSuccess { throw CompanionError(message: "The secure Rumi session could not be updated.") }
++        }
++        session = value; authenticated = true
++    }
++    private func accessToken() async throws -> String {
++        try allowed()
++        guard let session else { throw CompanionError(message: "Sign in to your existing Rumi account first.") }
++        if !session.needsRefresh { return session.access_token }
++        if let refreshTask {
++            let version = identity
++            let next = try await refreshTask.value
++            guard identity == version else { throw CancellationError() }
++            return next.access_token
++        }
++        let version = identity
++        let task = Task<RumiAPISession, Error> { [self] in
++            let next: RumiAPISession = try await perform("v1/auth/refresh", method: "POST", body: ["refresh_token": session.refresh_token])
++            guard identity == version else { throw CancellationError() }
++            try store(next)
++            return next
++        }
++        refreshTask = task
++        do { let next = try await task.value; guard identity == version else { throw CancellationError() }; refreshTask = nil; return next.access_token }
++        catch { if identity == version { disconnect() }; throw error }
++    }
++    func config() async throws -> RumiAPIConfig { try await perform("v1/config") }
++    func health() async throws -> RumiJSON { try await perform("health") }
++    func challenge(phone: String) async throws -> RumiAPIChallenge {
++        guard phone.range(of: "^\\+[1-9]\\d{7,14}$", options: .regularExpression) != nil else { throw CompanionError(message: "Use an international phone number, starting with +.") }
++        return try await perform("v1/auth/challenges", method: "POST", body: ["phone_number": phone])
++    }
++    func resend(_ challenge: RumiAPIChallenge) async throws -> RumiAPIChallenge {
++        guard UUID(uuidString: challenge.challenge_id) != nil else { throw CompanionError(message: "Invalid challenge.") }
++        return try await perform("v1/auth/challenges/\(challenge.challenge_id)/send", method: "POST", body: [:])
++    }
++    func verify(_ challenge: RumiAPIChallenge, code: String) async throws {
++        guard UUID(uuidString: challenge.challenge_id) != nil, code.range(of: "^\\d{6}$", options: .regularExpression) != nil else { throw CompanionError(message: "Enter the six-digit code from your Rumi message thread.") }
++        let value: RumiAPISession = try await perform("v1/auth/challenges/\(challenge.challenge_id)/verify", method: "POST", body: ["code": code])
++        try store(value); identity = UUID()
++    }
++    enum Resource: String, CaseIterable, Identifiable {
++        case profile = "me", context, records, memory, goals, actions, questions = "visit-questions", calls = "call-preferences", connections, messaging = "messaging/status", conversations
++        var id: String { rawValue }
++    }
++    func read(_ resource: Resource) async throws -> RumiJSON {
++        let token = try await accessToken()
++        return try await perform("v1/" + resource.rawValue, token: token)
++    }
++    func memory() async throws -> RumiAPIMemory { let token = try await accessToken(); return try await perform("v1/memory", token: token) }
++    func saveGoal(_ text: String, id: String) async throws -> RumiAPIReceipt {
++        guard (1...2000).contains(text.count) else { throw CompanionError(message: "A goal must contain 1–2,000 characters.") }
++        let token = try await accessToken()
++        return try await perform("v1/goals", method: "POST", body: ["text": text, "quote": text], token: token, idempotencyKey: id)
++    }
++    func logout() async throws {
++        let token = try await accessToken()
++        let _: RumiAPIReceipt = try await perform("v1/auth/logout", method: "POST", body: [:], token: token)
++        disconnect()
++    }
++}
+diff --git a/ios-rumi/Rumi/RumiAppAPIView.swift b/ios-rumi/Rumi/RumiAppAPIView.swift
+new file mode 100644
+--- /dev/null
++++ b/ios-rumi/Rumi/RumiAppAPIView.swift
+@@ -0,0 +1,141 @@
++import SwiftUI
++
++struct RumiAppAPIView: View {
++    @State private var api = RumiAppAPI.shared
++    @State private var base = RumiAppAPI.shared.settings?.baseURL ?? ""
++    @State private var appID = RumiAppAPI.shared.settings?.appID ?? ""
++    @State private var phone = ""
++    @State private var code = ""
++    @State private var challenge: RumiAPIChallenge?
++    @State private var configuration: RumiAPIConfig?
++    @State private var memory: RumiAPIMemory?
++    @State private var goal = ""
++    @State private var review: GoalReview?
++    @State private var busy = false
++    @State private var notice: String?
++    @State private var error: String?
++    @State private var uncertain = false
++    @State private var task: Task<Void, Never>?
++    private struct GoalReview: Identifiable { let id = UUID(); let text: String; let identity: UUID }
++    var body: some View {
++        Form {
++            Section {
++                Text("Connect to the existing Rumi service").font(.title2.bold())
++                Text("This is separate from the local demo and legacy Companion connection. The public app ID identifies the integration; a verified user session is still required to read personal data. No new backend is created.").font(.callout)
++            }
++            Section("Confirmed integration settings") {
++                TextField("HTTPS API base URL", text: $base).keyboardType(.URL).textInputAutocapitalization(.never).autocorrectionDisabled()
++                TextField("Public app ID", text: $appID).textInputAutocapitalization(.never).autocorrectionDisabled()
++                Button("Check service & save settings") {
++                    run {
++                        challenge = nil; configuration = nil; memory = nil
++                        try api.configure(RumiAPISettings(baseURL: base.trimmingCharacters(in: .whitespacesAndNewlines).trimmingCharacters(in: CharacterSet(charactersIn: "/")), appID: appID.trimmingCharacters(in: .whitespacesAndNewlines)))
++                        _ = try await api.health()
++                        configuration = try await api.config()
++                        notice = "The health and app configuration endpoints responded. This does not verify login or personal records."
++                    }
++                }.disabled(busy || base.isEmpty || appID.isEmpty)
++                if let configuration {
++                    LabeledContent("API version", value: configuration.api_version ?? "Not returned")
++                    LabeledContent("Records mode", value: configuration.records_mode ?? "Not returned")
++                }
++                Text("Awaiting the owner-confirmed base URL and app ID. Do not paste an ElevenLabs, Supabase, Photon or server key here. Changing these settings disconnects this API session.").font(.footnote)
++            }
++            if !api.authenticated {
++                Section("Verify your existing Rumi account") {
++                    TextField("+1 phone number", text: $phone).keyboardType(.phonePad).textContentType(.telephoneNumber)
++                    Button("Request code in Rumi iMessage") { run { challenge = try await api.challenge(phone: phone); notice = "Read the challenge status below. No code is returned to this app." } }.disabled(busy || api.settings == nil || phone.isEmpty)
++                    if let challenge {
++                        Text("Status: \(challenge.status.replacingOccurrences(of: "_", with: " "))")
++                        if challenge.status == "imessage_connection_needed" {
++                            Text("Send Hi to your existing Rumi messaging thread, then start a new challenge. Requesting a challenge does not establish ownership.")
++                            if let number = challenge.messaging_number { Text("Rumi messaging number: \(number)").textSelection(.enabled) }
++                        }
++                        if let seconds = challenge.expires_in { Text("Expiry window returned by service: \(seconds) seconds. Resending does not extend the original expiry.").font(.footnote) }
++                        TextField("Six-digit code", text: $code).keyboardType(.numberPad).textContentType(.oneTimeCode).privacySensitive()
++                        Button("Verify code") { run { try await api.verify(challenge, code: code); code = ""; phone = ""; self.challenge = nil; notice = "Rumi verified the session. Your token is stored only in this device’s Keychain." } }.disabled(busy || code.count != 6)
++                        Button("Resend code") { run { self.challenge = try await api.resend(challenge) } }.disabled(busy)
++                    }
++                }
++            } else {
++                Section("Verified account · Shared Rumi context") {
++                    Button("Refresh saved memory") { run { memory = try await api.memory() } }.disabled(busy)
++                    if let memory {
++                        LabeledContent("Memory permission", value: memory.memory_consent ?? "Not returned")
++                        ForEach(memory.items ?? []) { item in
++                            VStack(alignment: .leading) { Text(item.body?.text ?? "Saved item"); Text([item.kind, item.status].compactMap { $0 }.joined(separator: " · ")).font(.caption).foregroundStyle(.secondary) }
++                        }
++                        if memory.memory_consent == "granted" {
++                            TextField("A goal you choose", text: $goal, axis: .vertical).lineLimit(2...5)
++                            Button("Review exact goal") { review = GoalReview(text: goal.trimmingCharacters(in: .whitespacesAndNewlines), identity: api.identity) }.disabled(busy || uncertain || goal.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || goal.count > 2000)
++                        }
++                    }
++                    Text("Permission is managed by the existing Rumi service. Memory consent is not permission to call, book, send or change medicines.").font(.footnote)
++                }
++                Section("Inspect existing service data · Read only") {
++                    ForEach(RumiAppAPI.Resource.allCases) { resource in NavigationLink(resource.rawValue.replacingOccurrences(of: "-", with: " ").capitalized) { RumiAPIResourceView(resource: resource) } }
++                    Text("Records retain the service’s test/live mode and sources. No clinical charts are inferred from the loosely specified records payload. ElevenLabs session playback and write actions other than reviewed goal saving are not connected in this adapter yet.").font(.footnote)
++                }
++                Section {
++                    Button("Sign out through Rumi", role: .destructive) { run { try await api.logout(); clearPrivateState() } }.disabled(busy)
++                    Button("Remove session from this device", role: .destructive) { task?.cancel(); api.disconnect(); clearPrivateState(); notice = "Device credentials removed. This did not revoke remote sessions or pause calls." }
++                }
++            }
++            if busy { Section { ProgressView("Contacting existing Rumi service…") } }
++            if let notice { Section { Text(notice).font(.callout) } }
++            if let error { Section { Text(error).foregroundStyle(.red) } }
++            if uncertain { Section { Text("The save was not confirmed. It may have reached Rumi. Check saved goals before doing anything else; do not create a new submission to retry an uncertain write."); Button("I have checked the saved goals") { uncertain = false }.disabled(busy) } }
++        }.navigationTitle("Rumi App API")
++            .sheet(item: $review) { item in
++                NavigationStack {
++                    Form {
++                        Section("Save this exact goal to real Rumi?") { Text(item.text); Text("This is a real shared-memory save, not a demo receipt.").font(.footnote) }
++                        Button("Confirm save to Rumi") {
++                            review = nil
++                            run {
++                                guard api.identity == item.identity else { throw CompanionError(message: "The account changed. Review the goal again.") }
++                                uncertain = true
++                                let receipt = try await api.saveGoal(item.text, id: item.id.uuidString)
++                                guard receipt.confirmed else { throw CompanionError(message: "Rumi did not confirm that this goal was committed. Inspect the saved goals before retrying.") }
++                                uncertain = false; goal = ""; notice = "Rumi explicitly confirmed the goal save."
++                                memory = try await api.memory()
++                            }
++                        }.disabled(api.identity != item.identity || busy)
++                    }.navigationTitle("Review goal").toolbar { Button("Cancel") { review = nil } }
++                }
++            }
++            .onChange(of: api.identity) { _, _ in clearPrivateState() }
++            .onDisappear { task?.cancel(); task = nil }
++    }
++    private func clearPrivateState() { memory = nil; challenge = nil; code = ""; phone = ""; goal = ""; review = nil; notice = nil; error = nil; uncertain = false }
++    private func run(_ operation: @escaping @MainActor () async throws -> Void) {
++        guard !busy else { return }
++        busy = true; error = nil; notice = nil
++        task = Task { @MainActor in
++            defer { busy = false }
++            do { try await operation() } catch { if !Task.isCancelled { self.error = error.localizedDescription } }
++        }
++    }
++}
++
++private struct RumiAPIResourceView: View {
++    let resource: RumiAppAPI.Resource
++    @State private var result: RumiJSON?
++    @State private var error: String?
++    var body: some View {
++        ScrollView {
++            VStack(alignment: .leading, spacing: 16) {
++                Text("Read-only service response").font(.headline)
++                Text("This view preserves the API payload and its mode/source fields. It does not interpret, rewrite or combine it with demo profiles.").font(.footnote)
++                if let result { Text(result.formatted).font(.system(.callout, design: .monospaced)).textSelection(.enabled).privacySensitive() }
++                else if let error { Text(error).foregroundStyle(.red) }
++                else { ProgressView("Reading…") }
++            }.padding(20)
++        }.navigationTitle(resource.rawValue.capitalized)
++            .task {
++                do { result = try await RumiAppAPI.shared.read(resource) } catch { if !Task.isCancelled { self.error = error.localizedDescription } }
++            }
++            .onChange(of: RumiAppAPI.shared.identity) { _, _ in result = nil; error = "The account changed. Reopen this screen." }
++            .onDisappear { result = nil }
++    }
++}
+diff --git a/ios-rumi/RumiTests/RumiInsightsTests.swift b/ios-rumi/RumiTests/RumiInsightsTests.swift
+new file mode 100644
+--- /dev/null
++++ b/ios-rumi/RumiTests/RumiInsightsTests.swift
+@@ -0,0 +1,127 @@
++import Foundation
++import Testing
++@testable import Rumi
++
++@MainActor @Suite(.serialized)
++struct RumiInsightsTests {
++    let anchor = Date(timeIntervalSince1970: 1_793_275_200)
++    func query(_ operation: DemoInsightQuery.Operation, _ metrics: [DemoMetric], days: Int? = nil, count: Int? = nil) -> DemoInsightQuery {
++        DemoInsightQuery(operation: operation, metrics: metrics, days: days, count: count)
++    }
++    @Test func primaryNumbersAreSuppliedAndNotMaria() throws {
++        let result = try DemoInsightEngine.evaluate(query(.trend, [.a1c]), member: .primary, anchor: anchor)
++        #expect(result.series[0].observations.map(\.value) == [9, 8.8])
++        #expect(result.facts.contains("percentage points"))
++        #expect(!result.facts.contains("7.8"))
++        #expect(result.series[0].limitation.contains("illustrative"))
++        #expect(DemoInsightEngine.observations(member: .primary, metric: .weight, anchor: anchor).isEmpty)
++    }
++    @Test func latestAndLastNDoNotInventResults() throws {
++        let latest = try DemoInsightEngine.evaluate(query(.latest, [.a1c]), member: .primary, anchor: anchor)
++        #expect(latest.series[0].observations.map(\.value) == [8.8])
++        let last = try DemoInsightEngine.evaluate(query(.lastN, [.a1c], count: 4), member: .maria, anchor: anchor)
++        #expect(last.series[0].observations.map(\.value) == [8.6, 8.2, 7.8])
++        #expect(last.series[0].limitation.contains("fewer than requested"))
++        let two = try DemoInsightEngine.evaluate(query(.lastN, [.a1c], count: 2), member: .maria, anchor: anchor)
++        #expect(two.series[0].observations.map(\.value) == [8.2, 7.8])
++    }
++    @Test func sideBySidePreservesUnitsAndIndependentDates() throws {
++        let result = try DemoInsightEngine.evaluate(query(.sideBySide, [.a1c, .weight]), member: .tom, anchor: anchor)
++        #expect(result.series.count == 2)
++        #expect(result.series[0].observations.count == 1)
++        #expect(result.series[1].observations.count == 4)
++        #expect(result.series[0].metric.unit == "%")
++        #expect(result.series[1].metric.unit == "lb")
++        #expect(result.series[0].observations.first?.date != result.series[1].observations.first?.date)
++    }
++    @Test func rangesAreInclusiveAndMissingNotZero() throws {
++        let empty = try DemoInsightEngine.evaluate(query(.trend, [.a1c], days: 30), member: .primary, anchor: anchor)
++        #expect(empty.series[0].observations.isEmpty)
++        let partial = try DemoInsightEngine.evaluate(query(.trend, [.a1c], days: 90), member: .primary, anchor: anchor)
++        #expect(partial.series[0].observations.map(\.value) == [8.8])
++        let sleep = try DemoInsightEngine.evaluate(query(.trend, [.sleep], days: 14), member: .tom, anchor: anchor)
++        #expect(sleep.series[0].observations.count == 14)
++    }
++    @Test func unsupportedDataReturnsUnavailableNotSyntheticClaims() throws {
++        for member in DemoMember.allCases {
++            for metric in [DemoMetric.bmi, .glucose] {
++                let result = try DemoInsightEngine.evaluate(query(.trend, [metric]), member: member, anchor: anchor)
++                #expect(result.series[0].observations.isEmpty)
++            }
++            let cohort = try DemoInsightEngine.evaluate(query(.cohort, [.a1c]), member: member, anchor: anchor)
++            #expect(cohort.facts.contains("No validated comparison dataset"))
++            let tir = try DemoInsightEngine.evaluate(query(.timeInRange, [.tir]), member: member, anchor: anchor)
++            #expect(tir.series[0].observations.isEmpty)
++            #expect(!tir.facts.contains("70%"))
++        }
++    }
++    @Test func clinicalDescriptionsAreNeutral() throws {
++        let ldl = try DemoInsightEngine.evaluate(query(.trend, [.ldl]), member: .primary, anchor: anchor)
++        #expect(ldl.facts.contains("unchanged"))
++        let egfr = try DemoInsightEngine.evaluate(query(.trend, [.egfr]), member: .primary, anchor: anchor)
++        #expect(egfr.series[0].observations.map(\.value) == [60, 55])
++        for word in ["better", "worse", "abnormal", "healthy", "on target", "because"] { #expect(!egfr.facts.lowercased().contains(word)) }
++    }
++    @Test func strictToolArgumentsRejectInjectionAndInvalidBounds() throws {
++        let valid = "{\"requests\":[{\"operation\":\"trend\",\"metrics\":[\"HbA1c\"]}]}"
++        #expect(try DemoInsightEngine.parseQueries(valid).count == 1)
++        for invalid in [
++            "{\"requests\":[]}",
++            "{\"requests\":[{\"operation\":\"trend\",\"metrics\":[\"HbA1c\"],\"patient_id\":\"other\"}]}",
++            "{\"requests\":[{\"operation\":\"trend\",\"metrics\":[\"HbA1c\"],\"days\":-1}]}",
++            "{\"requests\":[{\"operation\":\"lastN\",\"metrics\":[\"HbA1c\"],\"count\":21}]}",
++            "{\"requests\":[{\"operation\":\"sideBySide\",\"metrics\":[\"HbA1c\"]}]}",
++            "{\"requests\":[{\"operation\":\"trend\",\"metrics\":[\"HbA1c\",\"HbA1c\"]}]}",
++            "{\"requests\":[{\"operation\":\"lastN\",\"metrics\":[\"HbA1c\"]}]}",
++            "{\"requests\":[{\"operation\":\"timeInRange\",\"metrics\":[\"HbA1c\"]}]}",
++            "{\"requests\":[{\"operation\":\"trend\",\"metrics\":[\"made-up\"]}]}"
++        ] { #expect(throws: (any Error).self) { try DemoInsightEngine.parseQueries(invalid) } }
++    }
++    @Test func multipleRequestsRemainSeparate() throws {
++        let queries = try DemoInsightEngine.parseQueries("{\"requests\":[{\"operation\":\"sideBySide\",\"metrics\":[\"HbA1c\",\"eGFR\"]},{\"operation\":\"latest\",\"metrics\":[\"LDL-C\"]}]}")
++        let results = try queries.map { try DemoInsightEngine.evaluate($0, member: .primary, anchor: anchor) }
++        #expect(results.count == 2)
++        #expect(results[0].series.count == 2)
++        #expect(results[1].series[0].observations.map(\.value) == [130])
++    }
++    @Test func numberMentionsAndDeviceProblemsDoNotTriggerLookups() {
++        for text in ["The 6.2 scared me", "My Dexcom sensor fell off", "I want a better bedtime", "Yes", "What is your name?", "Show my glucose, I have chest pain"] { #expect(!DemoInsightEngine.isExplicitDataRequest(text)) }
++        for text in ["Show my last 4 A1cs", "Compare my A1c with women like me", "My steps and A1c over 6 months", "Show CGM time in range"] { #expect(DemoInsightEngine.isExplicitDataRequest(text)) }
++    }
++    @Test func persistenceRemainsBackwardCompatible() throws {
++        let old = Data("{\"role\":\"assistant\",\"text\":\"Hello\",\"id\":\"00000000-0000-0000-0000-000000000001\",\"kind\":\"conversation\"}".utf8)
++        let turn = try JSONDecoder().decode(DemoTurn.self, from: old)
++        #expect(turn.insights == nil)
++        let insight = try DemoInsightEngine.evaluate(query(.trend, [.a1c]), member: .primary, anchor: anchor)
++        let new = DemoTurn(role: "assistant", text: "Facts", kind: "calculated-insight", insights: [insight], invitesGoal: true)
++        let copy = try JSONDecoder().decode(DemoTurn.self, from: JSONEncoder().encode(new))
++        #expect(copy.insights?.first?.series[0].observations.map(\.value) == [9, 8.8])
++        #expect(copy.invitesGoal == true)
++    }
++    @Test func apiRequestMatchesContractAndKeepsBasePath() throws {
++        let settings = RumiAPISettings(baseURL: "https://example.com/functions/v1/rumi-app-api", appID: "00000000-0000-0000-0000-000000000001")
++        let request = try RumiAppAPI.makeRequest(settings: settings, path: "v1/goals", method: "POST", body: ["text": "A chosen goal", "quote": "A chosen goal"], token: "user-session", idempotencyKey: "review-1")
++        #expect(request.url?.path == "/functions/v1/rumi-app-api/v1/goals")
++        #expect(request.value(forHTTPHeaderField: "x-rumi-app-id") == settings.appID)
++        #expect(request.value(forHTTPHeaderField: "Authorization") == "Bearer user-session")
++        #expect(request.value(forHTTPHeaderField: "Idempotency-Key") == "review-1")
++        #expect(request.value(forHTTPHeaderField: "x-rumi-server-key") == nil)
++        #expect(request.httpMethod == "POST")
++        #expect(throws: (any Error).self) { try RumiAPISettings(baseURL: "http://example.com", appID: settings.appID).validatedURL() }
++        #expect(throws: (any Error).self) { try RumiAPISettings(baseURL: "https://u:p@example.com", appID: settings.appID).validatedURL() }
++    }
++    @Test func httpSuccessIsNotCommitProof() throws {
++        for json in ["{}", "{\"status\":\"ok\"}", "{\"committed\":null}", "{\"committed\":false}"] {
++            #expect(!(try JSONDecoder().decode(RumiAPIReceipt.self, from: Data(json.utf8))).confirmed)
++        }
++        #expect(try JSONDecoder().decode(RumiAPIReceipt.self, from: Data("{\"committed\":true}".utf8)).confirmed)
++    }
++    @Test func demoBlocksExistingAccountConfigurationAndRequests() async {
++        let previous = DemoSession.shared.isPresented
++        DemoSession.shared.isPresented = true
++        defer { DemoSession.shared.isPresented = previous }
++        let api = RumiAppAPI(persist: false)
++        #expect(throws: (any Error).self) { try api.configure(RumiAPISettings(baseURL: "https://example.com", appID: "00000000-0000-0000-0000-000000000001")) }
++        do { _ = try await api.health(); Issue.record("Demo must never request real-account API data") } catch { #expect(error.localizedDescription.contains("blocked")) }
++    }
++}
+diff --git a/ios-rumi/RumiTests/RumiAPITransportTests.swift b/ios-rumi/RumiTests/RumiAPITransportTests.swift
+new file mode 100644
+--- /dev/null
++++ b/ios-rumi/RumiTests/RumiAPITransportTests.swift
+@@ -0,0 +1,76 @@
++import Foundation
++import Testing
++@testable import Rumi
++
++private final class APIStub: URLProtocol, @unchecked Sendable {
++    nonisolated(unsafe) static var respond: (@Sendable (URLRequest) -> (Int, Data))?
++    nonisolated override class func canInit(with request: URLRequest) -> Bool { true }
++    nonisolated override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
++    nonisolated override func startLoading() {
++        guard let (status, data) = Self.respond?(request), let url = request.url,
++              let response = HTTPURLResponse(url: url, statusCode: status, httpVersion: "HTTP/1.1", headerFields: ["Content-Type": "application/json"]) else { return }
++        client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
++        client?.urlProtocol(self, didLoad: data)
++        client?.urlProtocolDidFinishLoading(self)
++    }
++    nonisolated override func stopLoading() {}
++}
++private final class RequestLog: @unchecked Sendable {
++    private let lock = NSLock()
++    nonisolated(unsafe) private var items: [URLRequest] = []
++    nonisolated func append(_ request: URLRequest) { lock.lock(); defer { lock.unlock() }; items.append(request) }
++    nonisolated func all() -> [URLRequest] { lock.lock(); defer { lock.unlock() }; return items }
++}
++
++@MainActor @Suite(.serialized)
++struct RumiAPITransportTests {
++    let settings = RumiAPISettings(baseURL: "https://example.invalid/functions/v1/rumi-app-api", appID: "00000000-0000-0000-0000-000000000001")
++    let challenge = RumiAPIChallenge(challenge_id: "00000000-0000-0000-0000-000000000002", status: "code_sent", delivered: true, expires_in: 300, messaging_number: nil)
++    func api() throws -> RumiAppAPI {
++        let configuration = URLSessionConfiguration.ephemeral
++        configuration.protocolClasses = [APIStub.self]
++        let api = RumiAppAPI(transport: URLSession(configuration: configuration), persist: false)
++        try api.configure(settings)
++        return api
++    }
++    nonisolated static func session(expired: Bool, token: String) -> Data {
++        Data("{\"user_id\":\"member\",\"session_id\":\"session\",\"access_token\":\"\(String(repeating: token, count: 64))\",\"refresh_token\":\"\(String(repeating: "b", count: 64))\",\"expires_at\":\"\(expired ? "2000" : "2099")-01-01T00:00:00Z\"}".utf8)
++    }
++    @Test func concurrentReadsRotateRefreshOnceAndUseNewToken() async throws {
++        let log = RequestLog()
++        APIStub.respond = { request in
++            log.append(request)
++            if request.url!.path.hasSuffix("/verify") { return (200, Self.session(expired: true, token: "a")) }
++            if request.url!.path.hasSuffix("/refresh") { return (200, Self.session(expired: false, token: "c")) }
++            return (200, Data("{}".utf8))
++        }
++        defer { APIStub.respond = nil }
++        let api = try api()
++        try await api.verify(challenge, code: "123456")
++        async let profile = api.read(.profile)
++        async let goals = api.read(.goals)
++        _ = try await (profile, goals)
++        let requests = log.all()
++        #expect(requests.filter { $0.url!.path.hasSuffix("/refresh") }.count == 1)
++        for request in requests.filter({ $0.httpMethod == "GET" }) {
++            #expect(request.value(forHTTPHeaderField: "Authorization") == "Bearer " + String(repeating: "c", count: 64))
++        }
++        #expect(api.authenticated)
++    }
++    @Test func httpErrorsDoNotExposeServiceBodyOrAuthenticate() async throws {
++        APIStub.respond = { _ in (401, Data("{\"private\":\"DO_NOT_DISPLAY_TOKEN\"}".utf8)) }
++        defer { APIStub.respond = nil }
++        let api = try api()
++        do { try await api.verify(challenge, code: "123456"); Issue.record("401 must fail") }
++        catch { #expect(!error.localizedDescription.contains("DO_NOT_DISPLAY_TOKEN")) }
++        #expect(!api.authenticated)
++    }
++    @Test func invalidSessionTokensFailClosed() async throws {
++        APIStub.respond = { _ in (200, Self.session(expired: false, token: "z")) }
++        defer { APIStub.respond = nil }
++        let api = try api()
++        do { try await api.verify(challenge, code: "123456"); Issue.record("Non-hex token must not authenticate") }
++        catch { #expect(error.localizedDescription.contains("invalid session")) }
++        #expect(!api.authenticated)
++    }
++}
+diff --git a/ios-rumi/RumiUITests/RumiInsightsUITests.swift b/ios-rumi/RumiUITests/RumiInsightsUITests.swift
+new file mode 100644
+--- /dev/null
++++ b/ios-rumi/RumiUITests/RumiInsightsUITests.swift
+@@ -0,0 +1,44 @@
++import XCTest
++
++final class RumiInsightsUITests: XCTestCase {
++    @MainActor
++    func reveal(_ element: XCUIElement, in app: XCUIApplication, maxSwipes: Int = 14) {
++        for _ in 0..<maxSwipes {
++            if element.exists && element.isHittable { return }
++            app.swipeUp()
++        }
++    }
++    @MainActor
++    func testPrimaryWalkthroughShowsCalculatedChartWithoutNetwork() throws {
++        continueAfterFailure = false
++        let app = XCUIApplication(); app.launch()
++        let entry = app.buttons["Explore a demo"]
++        XCTAssertTrue(entry.waitForExistence(timeout: 10)); entry.tap()
++        XCTAssertTrue(app.buttons["demo.member.primary"].waitForExistence(timeout: 10))
++        let start = app.buttons["demo.start"]; reveal(start, in: app)
++        XCTAssertTrue(start.isHittable); start.tap()
++        let walkthrough = app.buttons["demo.insights.walkthrough"]
++        XCTAssertTrue(walkthrough.waitForExistence(timeout: 10)); reveal(walkthrough, in: app); walkthrough.tap()
++        let a1c = app.descendants(matching: .any).matching(identifier: "demo.insight.focused").firstMatch
++        reveal(a1c, in: app)
++        XCTAssertTrue(a1c.exists, "Calculated focus value missing. UI: \(app.debugDescription.suffix(16000))")
++        XCTAssertTrue(a1c.label.replacingOccurrences(of: ",", with: ".").contains("8.8"), "Primary latest value must be 8.8 in the device locale, got \(a1c.label)")
++        let values = app.descendants(matching: .any).matching(identifier: "demo.insight.values").firstMatch
++        reveal(values, in: app); XCTAssertTrue(values.isHittable, "Accessible values disclosure missing. UI: \(app.debugDescription.suffix(16000))"); values.tap()
++        XCTAssertTrue(app.staticTexts.matching(NSPredicate(format: "label CONTAINS %@", "9 %")).firstMatch.exists, "Expanded dates/values must include earlier A1c 9%. UI: \(app.debugDescription.suffix(16000))")
++    }
++    @MainActor
++    func testCareRehearsalRequiresExactReviewAndCancelDoesNotSave() throws {
++        continueAfterFailure = false
++        let app = XCUIApplication(); app.launch()
++        app.buttons["Explore a demo"].tap()
++        let start = app.buttons["demo.start"]; XCTAssertTrue(start.waitForExistence(timeout: 10)); reveal(start, in: app); start.tap()
++        let walkthrough = app.buttons["demo.insights.walkthrough"]; XCTAssertTrue(walkthrough.waitForExistence(timeout: 10)); reveal(walkthrough, in: app); walkthrough.tap()
++        let followups = app.buttons["demo.care.followups"]; reveal(followups, in: app); XCTAssertTrue(followups.isHittable); followups.tap()
++        let prepare = app.buttons["Prepare a question"]; XCTAssertTrue(prepare.waitForExistence(timeout: 10)); prepare.tap()
++        XCTAssertTrue(app.staticTexts["Would you like to prepare a refill question for your prescriber?"].waitForExistence(timeout: 5))
++        XCTAssertTrue(app.buttons["Confirm local rehearsal · Not sent"].exists)
++        app.buttons["Cancel"].tap()
++        XCTAssertFalse(app.staticTexts.matching(NSPredicate(format: "label BEGINSWITH %@", "Care rehearsal · Refill reminder")).firstMatch.exists)
++    }
++}
+diff --git a/integrations/rumi-app-api/openapi.json b/integrations/rumi-app-api/openapi.json
+new file mode 100644
+--- /dev/null
++++ b/integrations/rumi-app-api/openapi.json
+@@ -0,0 +1 @@
++{"openapi":"3.1.0","info":{"title":"Rumi App API","version":"1.0.0","description":"Use the existing Rumi backend from a lightweight app. Send x-rumi-app-id on API requests and a user Bearer token after login. The app ID identifies an integration; it does not grant access to anyone’s memory. Login through Rumi iMessage, or exchange an already verified identity from your trusted app server. No new Supabase, Photon or ElevenLabs project is required."},"security":[{"AppId":[],"Bearer":[]}],"tags":[{"name":"Service"},{"name":"Login"},{"name":"Profile"},{"name":"Memory"},{"name":"Goals"},{"name":"Calls"},{"name":"Records"},{"name":"Connections"},{"name":"Messaging"},{"name":"Conversations"}],"paths":{"/health":{"get":{"tags":["Service"],"summary":"Check API availability","security":[],"responses":{"200":{"description":"Success","content":{"application/json":{"schema":{"type":"object","properties":{"status":{"type":"string"},"service":{"type":"string"},"version":{"type":"string"}},"required":[],"additionalProperties":false}}}},"400":{"description":"Request cannot be completed; inspect error.code.","content":{"application/json":{"schema":{"$ref":"#/components/schemas/Error"}}}},"401":{"description":"Request cannot be completed; inspect error.code.","content":{"application/json":{"schema":{"$ref":"#/components/schemas/Error"}}}},"403":{"description":"Request cannot be completed; inspect error.code.","content":{"application/json":{"schema":{"$ref":"#/components/schemas/Error"}}}},"409":{"description":"Request cannot be completed; inspect error.code.","content":{"application/json":{"schema":{"$ref":"#/components/schemas/Error"}}}},"413":{"description":"Request cannot be completed; inspect error.code.","content":{"application/json":{"schema":{"$ref":"#/components/schemas/Error"}}}},"415":{"description":"Request cannot be completed; inspect error.code.","content":{"application/json":{"schema":{"$ref":"#/components/schemas/Error"}}}},"429":{"description":"Request cannot be completed; inspect error.code.","content":{"application/json":{"schema":{"$ref":"#/components/schemas/Error"}}}},"503":{"description":"Request cannot be completed; inspect error.code.","content":{"application/json":{"schema":{"$ref":"#/components/schemas/Error"}}}}}}},"/v1/config":{"get":{"tags":["Service"],"summary":"Get the app connection settings","security":[{"AppId":[]}],"responses":{"200":{"description":"Success","content":{"application/json":{"schema":{"$ref":"#/components/schemas/Config"}}}},"400":{"description":"Request cannot be completed; inspect error.code.","content":{"application/json":{"schema":{"$ref":"#/components/schemas/Error"}}}},"401":{"description":"Request cannot be completed; inspect error.code.","content":{"application/json":{"schema":{"$ref":"#/components/schemas/Error"}}}},"403":{"description":"Request cannot be completed; inspect error.code.","content":{"application/json":{"schema":{"$ref":"#/components/schemas/Error"}}}},"409":{"description":"Request cannot be completed; inspect error.code.","content":{"application/json":{"schema":{"$ref":"#/components/schemas/Error"}}}},"413":{"description":"Request cannot be completed; inspect error.code.","content":{"application/json":{"schema":{"$ref":"#/components/schemas/Error"}}}},"415":{"description":"Request cannot be completed; inspect error.code.","content":{"application/json":{"schema":{"$ref":"#/components/schemas/Error"}}}},"429":{"description":"Request cannot be completed; inspect error.code.","content":{"application/json":{"schema":{"$ref":"#/components/schemas/Error"}}}},"503":{"description":"Request cannot be completed; inspect error.code.","content":{"application/json":{"schema":{"$ref":"#/components/schemas/Error"}}}}}}},"/v1/auth/exchange":{"post":{"tags":["Login"],"summary":"Exchange your app server’s verified user identity for a Rumi session","description":"Server-to-server only. The integrating server must authenticate its own user and verify their phone first. Never ship x-rumi-server-key in a mobile or browser build. The phone links to the existing Rumi user used by messaging and calls.","security":[{"AppId":[],"ServerKey":[]}],"requestBody":{"required":true,"content":{"application/json":{"schema":{"type":"object","properties":{"external_user_id":{"type":"string","minLength":1,"maxLength":200},"phone_number":{"type":"string","pattern":"^\\+[1-9]\\d{7,14}$"},"phone_verified":{"const":true}},"required":["external_user_id","phone_number","phone_verified"],"additionalProperties":false}}}},"responses":{"201":{"description":"Success","content":{"application/json":{"schema":{"$ref":"#/components/schemas/Session"}}}},"400":{"description":"Request cannot be completed; inspect error.code.","content":{"application/json":{"schema":{"$ref":"#/components/schemas/Error"}}}},"401":{"description":"Request cannot be completed; inspect error.code.","content":{"application/json":{"schema":{"$ref":"#/components/schemas/Error"}}}},"403":{"description":"Request cannot be completed; inspect error.code.","content":{"application/json":{"schema":{"$ref":"#/components/schemas/Error"}}}},"409":{"description":"Request cannot be completed; inspect error.code.","content":{"application/json":{"schema":{"$ref":"#/components/schemas/Error"}}}},"413":{"description":"Request cannot be completed; inspect error.code.","content":{"application/json":{"schema":{"$ref":"#/components/schemas/Error"}}}},"415":{"description":"Request cannot be completed; inspect error.code.","content":{"application/json":{"schema":{"$ref":"#/components/schemas/Error"}}}},"429":{"description":"Request cannot be completed; inspect error.code.","content":{"application/json":{"schema":{"$ref":"#/components/schemas/Error"}}}},"503":{"description":"Request cannot be completed; inspect error.code.","content":{"application/json":{"schema":{"$ref":"#/components/schemas/Error"}}}}}}},"/v1/auth/challenges":{"post":{"tags":["Login"],"summary":"Request a code in the user’s existing Rumi message thread","description":"If status is imessage_connection_needed, have the person send Hi to messaging_number and then resend this challenge. No code is returned by this API.","security":[{"AppId":[]}],"requestBody":{"required":true,"content":{"application/json":{"schema":{"type":"object","properties":{"phone_number":{"type":"string","pattern":"^\\+[1-9]\\d{7,14}$"}},"required":["phone_number"],"additionalProperties":false}}}},"responses":{"202":{"description":"Success","content":{"application/json":{"schema":{"$ref":"#/components/schemas/Challenge"}}}},"400":{"description":"Request cannot be completed; inspect error.code.","content":{"application/json":{"schema":{"$ref":"#/components/schemas/Error"}}}},"401":{"description":"Request cannot be completed; inspect error.code.","content":{"application/json":{"schema":{"$ref":"#/components/schemas/Error"}}}},"403":{"description":"Request cannot be completed; inspect error.code.","content":{"application/json":{"schema":{"$ref":"#/components/schemas/Error"}}}},"409":{"description":"Request cannot be completed; inspect error.code.","content":{"application/json":{"schema":{"$ref":"#/components/schemas/Error"}}}},"413":{"description":"Request cannot be completed; inspect error.code.","content":{"application/json":{"schema":{"$ref":"#/components/schemas/Error"}}}},"415":{"description":"Request cannot be completed; inspect error.code.","content":{"application/json":{"schema":{"$ref":"#/components/schemas/Error"}}}},"429":{"description":"Request cannot be completed; inspect error.code.","content":{"application/json":{"schema":{"$ref":"#/components/schemas/Error"}}}},"503":{"description":"Request cannot be completed; inspect error.code.","content":{"application/json":{"schema":{"$ref":"#/components/schemas/Error"}}}}}}},"/v1/auth/challenges/{challenge_id}/send":{"post":{"tags":["Login"],"summary":"Resend the verification code","description":"Provider and per-user rate limits apply. A resend does not extend the original app challenge expiry; start a new challenge when it expires.","security":[{"AppId":[]}],"requestBody":{"required":true,"content":{"application/json":{"schema":{"type":"object","properties":{},"required":[],"additionalProperties":false}}}},"parameters":[{"name":"challenge_id","in":"path","required":true,"schema":{"type":"string","format":"uuid"}}],"responses":{"202":{"description":"Success","content":{"application/json":{"schema":{"$ref":"#/components/schemas/Challenge"}}}},"400":{"description":"Request cannot be completed; inspect error.code.","content":{"application/json":{"schema":{"$ref":"#/components/schemas/Error"}}}},"401":{"description":"Request cannot be completed; inspect error.code.","content":{"application/json":{"schema":{"$ref":"#/components/schemas/Error"}}}},"403":{"description":"Request cannot be completed; inspect error.code.","content":{"application/json":{"schema":{"$ref":"#/components/schemas/Error"}}}},"409":{"description":"Request cannot be completed; inspect error.code.","content":{"application/json":{"schema":{"$ref":"#/components/schemas/Error"}}}},"413":{"description":"Request cannot be completed; inspect error.code.","content":{"application/json":{"schema":{"$ref":"#/components/schemas/Error"}}}},"415":{"description":"Request cannot be completed; inspect error.code.","content":{"application/json":{"schema":{"$ref":"#/components/schemas/Error"}}}},"429":{"description":"Request cannot be completed; inspect error.code.","content":{"application/json":{"schema":{"$ref":"#/components/schemas/Error"}}}},"503":{"description":"Request cannot be completed; inspect error.code.","content":{"application/json":{"schema":{"$ref":"#/components/schemas/Error"}}}}}}},"/v1/auth/challenges/{challenge_id}/verify":{"post":{"tags":["Login"],"summary":"Verify the code and open the user session","security":[{"AppId":[]}],"requestBody":{"required":true,"content":{"application/json":{"schema":{"type":"object","properties":{"code":{"type":"string","pattern":"^\\d{6}$"}},"required":["code"],"additionalProperties":false}}}},"parameters":[{"name":"challenge_id","in":"path","required":true,"schema":{"type":"string","format":"uuid"}}],"responses":{"200":{"description":"Success","content":{"application/json":{"schema":{"$ref":"#/components/schemas/Session"}}}},"400":{"description":"Request cannot be completed; inspect error.code.","content":{"application/json":{"schema":{"$ref":"#/components/schemas/Error"}}}},"401":{"description":"Request cannot be completed; inspect error.code.","content":{"application/json":{"schema":{"$ref":"#/components/schemas/Error"}}}},"403":{"description":"Request cannot be completed; inspect error.code.","content":{"application/json":{"schema":{"$ref":"#/components/schemas/Error"}}}},"409":{"description":"Request cannot be completed; inspect error.code.","content":{"application/json":{"schema":{"$ref":"#/components/schemas/Error"}}}},"413":{"description":"Request cannot be completed; inspect error.code.","content":{"application/json":{"schema":{"$ref":"#/components/schemas/Error"}}}},"415":{"description":"Request cannot be completed; inspect error.code.","content":{"application/json":{"schema":{"$ref":"#/components/schemas/Error"}}}},"429":{"description":"Request cannot be completed; inspect error.code.","content":{"application/json":{"schema":{"$ref":"#/components/schemas/Error"}}}},"503":{"description":"Request cannot be completed; inspect error.code.","content":{"application/json":{"schema":{"$ref":"#/components/schemas/Error"}}}}}}},"/v1/auth/refresh":{"post":{"tags":["Login"],"summary":"Rotate a refresh token","description":"Access lasts 30 minutes; the refresh session lasts 14 days. Use the newly returned refresh token. Reuse of the previous token revokes the session. The SDK coordinates concurrent refresh requests.","security":[{"AppId":[]}],"requestBody":{"required":true,"content":{"application/json":{"schema":{"type":"object","properties":{"refresh_token":{"type":"string","pattern":"^[a-f0-9]{64}$"}},"required":["refresh_token"],"additionalProperties":false}}}},"responses":{"200":{"description":"Success","content":{"application/json":{"schema":{"$ref":"#/components/schemas/Session"}}}},"400":{"description":"Request cannot be completed; inspect error.code.","content":{"application/json":{"schema":{"$ref":"#/components/schemas/Error"}}}},"401":{"description":"Request cannot be completed; inspect error.code.","content":{"application/json":{"schema":{"$ref":"#/components/schemas/Error"}}}},"403":{"description":"Request cannot be completed; inspect error.code.","content":{"application/json":{"schema":{"$ref":"#/components/schemas/Error"}}}},"409":{"description":"Request cannot be completed; inspect error.code.","content":{"application/json":{"schema":{"$ref":"#/components/schemas/Error"}}}},"413":{"description":"Request cannot be completed; inspect error.code.","content":{"application/json":{"schema":{"$ref":"#/components/schemas/Error"}}}},"415":{"description":"Request cannot be completed; inspect error.code.","content":{"application/json":{"schema":{"$ref":"#/components/schemas/Error"}}}},"429":{"description":"Request cannot be completed; inspect error.code.","content":{"application/json":{"schema":{"$ref":"#/components/schemas/Error"}}}},"503":{"description":"Request cannot be completed; inspect error.code.","content":{"application/json":{"schema":{"$ref":"#/components/schemas/Error"}}}}}}},"/v1/auth/logout":{"post":{"tags":["Login"],"summary":"Close the app session and its app conversations","requestBody":{"required":true,"content":{"application/json":{"schema":{"type":"object","properties":{},"required":[],"additionalProperties":false}}}},"responses":{"200":{"description":"Success","content":{"application/json":{"schema":{"$ref":"#/components/schemas/Receipt"}}}},"400":{"description":"Request cannot be completed; inspect error.code.","content":{"application/json":{"schema":{"$ref":"#/components/schemas/Error"}}}},"401":{"description":"Request cannot be completed; inspect error.code.","content":{"application/json":{"schema":{"$ref":"#/components/schemas/Error"}}}},"403":{"description":"Request cannot be completed; inspect error.code.","content":{"application/json":{"schema":{"$ref":"#/components/schemas/Error"}}}},"409":{"description":"Request cannot be completed; inspect error.code.","content":{"application/json":{"schema":{"$ref":"#/components/schemas/Error"}}}},"413":{"description":"Request cannot be completed; inspect error.code.","content":{"application/json":{"schema":{"$ref":"#/components/schemas/Error"}}}},"415":{"description":"Request cannot be completed; inspect error.code.","content":{"application/json":{"schema":{"$ref":"#/components/schemas/Error"}}}},"429":{"description":"Request cannot be completed; inspect error.code.","content":{"application/json":{"schema":{"$ref":"#/components/schemas/Error"}}}},"503":{"description":"Request cannot be completed; inspect error.code.","content":{"application/json":{"schema":{"$ref":"#/components/schemas/Error"}}}}}}},"/v1/me":{"get":{"tags":["Profile"],"summary":"Get the signed-in Rumi user","responses":{"200":{"description":"Success","content":{"application/json":{"schema":{"type":"object","properties":{"user_id":{"type":"string","format":"uuid"},"preferred_name":{"type":["string","null"]},"timezone":{"type":["string","null"]},"memory_consent":{"type":"string","enum":["unknown","granted","declined","withdrawn"]},"state_version":{"type":"integer"}},"required":[],"additionalProperties":false}}}},"400":{"description":"Request cannot be completed; inspect error.code.","content":{"application/json":{"schema":{"$ref":"#/components/schemas/Error"}}}},"401":{"description":"Request cannot be completed; inspect error.code.","content":{"application/json":{"schema":{"$ref":"#/components/schemas/Error"}}}},"403":{"description":"Request cannot be completed; inspect error.code.","content":{"application/json":{"schema":{"$ref":"#/components/schemas/Error"}}}},"409":{"description":"Request cannot be completed; inspect error.code.","content":{"application/json":{"schema":{"$ref":"#/components/schemas/Error"}}}},"413":{"description":"Request cannot be completed; inspect error.code.","content":{"application/json":{"schema":{"$ref":"#/components/schemas/Error"}}}},"415":{"description":"Request cannot be completed; inspect error.code.","content":{"application/json":{"schema":{"$ref":"#/components/schemas/Error"}}}},"429":{"description":"Request cannot be completed; inspect error.code.","content":{"application/json":{"schema":{"$ref":"#/components/schemas/Error"}}}},"503":{"description":"Request cannot be completed; inspect error.code.","content":{"application/json":{"schema":{"$ref":"#/components/schemas/Error"}}}}}}},"/v1/context":{"get":{"tags":["Profile"],"summary":"Get permitted memory, clinical context and connection status","description":"Uses the existing Rumi context service. Saved context requires memory permission; the records subset is bounded and retains test/live mode.","responses":{"200":{"description":"Success","content":{"application/json":{"schema":{"type":"object","additionalProperties":true}}}},"400":{"description":"Request cannot be completed; inspect error.code.","content":{"application/json":{"schema":{"$ref":"#/components/schemas/Error"}}}},"401":{"description":"Request cannot be completed; inspect error.code.","content":{"application/json":{"schema":{"$ref":"#/components/schemas/Error"}}}},"403":{"description":"Request cannot be completed; inspect error.code.","content":{"application/json":{"schema":{"$ref":"#/components/schemas/Error"}}}},"409":{"description":"Request cannot be completed; inspect error.code.","content":{"application/json":{"schema":{"$ref":"#/components/schemas/Error"}}}},"413":{"description":"Request cannot be completed; inspect error.code.","content":{"application/json":{"schema":{"$ref":"#/components/schemas/Error"}}}},"415":{"description":"Request cannot be completed; inspect error.code.","content":{"application/json":{"schema":{"$ref":"#/components/schemas/Error"}}}},"429":{"description":"Request cannot be completed; inspect error.code.","content":{"application/json":{"schema":{"$ref":"#/components/schemas/Error"}}}},"503":{"description":"Request cannot be completed; inspect error.code.","content":{"application/json":{"schema":{"$ref":"#/components/schemas/Error"}}}}}}},"/v1/memory":{"get":{"tags":["Memory"],"summary":"Read saved items and the current plan","responses":{"200":{"description":"Success","content":{"application/json":{"schema":{"$ref":"#/components/schemas/Memory"}}}},"400":{"description":"Request cannot be completed; inspect error.code.","content":{"application/json":{"schema":{"$ref":"#/components/schemas/Error"}}}},"401":{"description":"Request cannot be completed; inspect error.code.","content":{"application/json":{"schema":{"$ref":"#/components/schemas/Error"}}}},"403":{"description":"Request cannot be completed; inspect error.code.","content":{"application/json":{"schema":{"$ref":"#/components/schemas/Error"}}}},"409":{"description":"Request cannot be completed; inspect error.code.","content":{"application/json":{"schema":{"$ref":"#/components/schemas/Error"}}}},"413":{"description":"Request cannot be completed; inspect error.code.","content":{"application/json":{"schema":{"$ref":"#/components/schemas/Error"}}}},"415":{"description":"Request cannot be completed; inspect error.code.","content":{"application/json":{"schema":{"$ref":"#/components/schemas/Error"}}}},"429":{"description":"Request cannot be completed; inspect error.code.","content":{"application/json":{"schema":{"$ref":"#/components/schemas/Error"}}}},"503":{"description":"Request cannot be completed; inspect error.code.","content":{"application/json":{"schema":{"$ref":"#/components/schemas/Error"}}}}}}},"/v1/memory/operations":{"post":{"tags":["Memory"],"summary":"Apply an existing scoped memory operation","description":"The existing memory contract validates ownership, evidence and permission. Use item_id for correction/deletion and parent_id for actions/progress. An operation can return committed:false or committed:null; do not show success from HTTP 200 alone.","requestBody":{"required":true,"content":{"application/json":{"schema":{"type":"object","properties":{"operation":{"type":"string","enum":["save_report","set_consent","save_goal","save_action","report_progress","save_visit_question","correct_item","delete_item","forget_memory","set_name","set_schedule","pause_calls"]},"input":{"type":"object","additionalProperties":true}},"required":["operation","input"],"additionalProperties":false}}}},"parameters":[{"$ref":"#/components/parameters/IdempotencyKey"}],"responses":{"200":{"description":"Success","content":{"application/json":{"schema":{"$ref":"#/components/schemas/Receipt"}}}},"400":{"description":"Request cannot be completed; inspect error.code.","content":{"application/json":{"schema":{"$ref":"#/components/schemas/Error"}}}},"401":{"description":"Request cannot be completed; inspect error.code.","content":{"application/json":{"schema":{"$ref":"#/components/schemas/Error"}}}},"403":{"description":"Request cannot be completed; inspect error.code.","content":{"application/json":{"schema":{"$ref":"#/components/schemas/Error"}}}},"409":{"description":"Request cannot be completed; inspect error.code.","content":{"application/json":{"schema":{"$ref":"#/components/schemas/Error"}}}},"413":{"description":"Request cannot be completed; inspect error.code.","content":{"application/json":{"schema":{"$ref":"#/components/schemas/Error"}}}},"415":{"description":"Request cannot be completed; inspect error.code.","content":{"application/json":{"schema":{"$ref":"#/components/schemas/Error"}}}},"429":{"description":"Request cannot be completed; inspect error.code.","content":{"application/json":{"schema":{"$ref":"#/components/schemas/Error"}}}},"503":{"description":"Request cannot be completed; inspect error.code.","content":{"application/json":{"schema":{"$ref":"#/components/schemas/Error"}}}}}}},"/v1/memory/forget":{"post":{"tags":["Memory"],"summary":"Forget saved memory using the existing deletion flow","requestBody":{"required":true,"content":{"application/json":{"schema":{"type":"object","properties":{"quote":{"type":"string","minLength":1,"maxLength":4000}},"required":["quote"],"additionalProperties":false}}}},"parameters":[{"$ref":"#/components/parameters/IdempotencyKey"}],"responses":{"200":{"description":"Success","content":{"application/json":{"schema":{"$ref":"#/components/schemas/Receipt"}}}},"400":{"description":"Request cannot be completed; inspect error.code.","content":{"application/json":{"schema":{"$ref":"#/components/schemas/Error"}}}},"401":{"description":"Request cannot be completed; inspect error.code.","content":{"application/json":{"schema":{"$ref":"#/components/schemas/Error"}}}},"403":{"description":"Request cannot be completed; inspect error.code.","content":{"application/json":{"schema":{"$ref":"#/components/schemas/Error"}}}},"409":{"description":"Request cannot be completed; inspect error.code.","content":{"application/json":{"schema":{"$ref":"#/components/schemas/Error"}}}},"413":{"description":"Request cannot be completed; inspect error.code.","content":{"application/json":{"schema":{"$ref":"#/components/schemas/Error"}}}},"415":{"description":"Request cannot be completed; inspect error.code.","content":{"application/json":{"schema":{"$ref":"#/components/schemas/Error"}}}},"429":{"description":"Request cannot be completed; inspect error.code.","content":{"application/json":{"schema":{"$ref":"#/components/schemas/Error"}}}},"503":{"description":"Request cannot be completed; inspect error.code.","content":{"application/json":{"schema":{"$ref":"#/components/schemas/Error"}}}}}}},"/v1/preferences":{"patch":{"tags":["Profile"],"summary":"Update one preference","requestBody":{"required":true,"content":{"application/json":{"schema":{"oneOf":[{"type":"object","properties":{"memory_consent":{"type":"string","enum":["granted","declined","withdrawn"]},"quote":{"type":"string","minLength":1,"maxLength":4000}},"required":["memory_consent","quote"],"additionalProperties":false},{"type":"object","properties":{"preferred_name":{"type":"string","minLength":1,"maxLength":80},"quote":{"type":"string","minLength":1,"maxLength":4000}},"required":["preferred_name"],"additionalProperties":false}]}}}},"parameters":[{"$ref":"#/components/parameters/IdempotencyKey"}],"responses":{"200":{"description":"Success","content":{"application/json":{"schema":{"$ref":"#/components/schemas/Receipt"}}}},"400":{"description":"Request cannot be completed; inspect error.code.","content":{"application/json":{"schema":{"$ref":"#/components/schemas/Error"}}}},"401":{"description":"Request cannot be completed; inspect error.code.","content":{"application/json":{"schema":{"$ref":"#/components/schemas/Error"}}}},"403":{"description":"Request cannot be completed; inspect error.code.","content":{"application/json":{"schema":{"$ref":"#/components/schemas/Error"}}}},"409":{"description":"Request cannot be completed; inspect error.code.","content":{"application/json":{"schema":{"$ref":"#/components/schemas/Error"}}}},"413":{"description":"Request cannot be completed; inspect error.code.","content":{"application/json":{"schema":{"$ref":"#/components/schemas/Error"}}}},"415":{"description":"Request cannot be completed; inspect error.code.","content":{"application/json":{"schema":{"$ref":"#/components/schemas/Error"}}}},"429":{"description":"Request cannot be completed; inspect error.code.","content":{"application/json":{"schema":{"$ref":"#/components/schemas/Error"}}}},"503":{"description":"Request cannot be completed; inspect error.code.","content":{"application/json":{"schema":{"$ref":"#/components/schemas/Error"}}}}}}},"/v1/goals":{"get":{"tags":["Goals"],"summary":"List saved goals","responses":{"200":{"description":"Success","content":{"application/json":{"schema":{"$ref":"#/components/schemas/Memory"}}}},"400":{"description":"Request cannot be completed; inspect error.code.","content":{"application/json":{"schema":{"$ref":"#/components/schemas/Error"}}}},"401":{"description":"Request cannot be completed; inspect error.code.","content":{"application/json":{"schema":{"$ref":"#/components/schemas/Error"}}}},"403":{"description":"Request cannot be completed; inspect error.code.","content":{"application/json":{"schema":{"$ref":"#/components/schemas/Error"}}}},"409":{"description":"Request cannot be completed; inspect error.code.","content":{"application/json":{"schema":{"$ref":"#/components/schemas/Error"}}}},"413":{"description":"Request cannot be completed; inspect error.code.","content":{"application/json":{"schema":{"$ref":"#/components/schemas/Error"}}}},"415":{"description":"Request cannot be completed; inspect error.code.","content":{"application/json":{"schema":{"$ref":"#/components/schemas/Error"}}}},"429":{"description":"Request cannot be completed; inspect error.code.","content":{"application/json":{"schema":{"$ref":"#/components/schemas/Error"}}}},"503":{"description":"Request cannot be completed; inspect error.code.","content":{"application/json":{"schema":{"$ref":"#/components/schemas/Error"}}}}}},"post":{"tags":["Goals"],"summary":"Save the user’s chosen goal","requestBody":{"required":true,"content":{"application/json":{"schema":{"$ref":"#/components/schemas/ChosenText"}}}},"parameters":[{"$ref":"#/components/parameters/IdempotencyKey"}],"responses":{"201":{"description":"Success","content":{"application/json":{"schema":{"$ref":"#/components/schemas/Receipt"}}}},"400":{"description":"Request cannot be completed; inspect error.code.","content":{"application/json":{"schema":{"$ref":"#/components/schemas/Error"}}}},"401":{"description":"Request cannot be completed; inspect error.code.","content":{"application/json":{"schema":{"$ref":"#/components/schemas/Error"}}}},"403":{"description":"Request cannot be completed; inspect error.code.","content":{"application/json":{"schema":{"$ref":"#/components/schemas/Error"}}}},"409":{"description":"Request cannot be completed; inspect error.code.","content":{"application/json":{"schema":{"$ref":"#/components/schemas/Error"}}}},"413":{"description":"Request cannot be completed; inspect error.code.","content":{"application/json":{"schema":{"$ref":"#/components/schemas/Error"}}}},"415":{"description":"Request cannot be completed; inspect error.code.","content":{"application/json":{"schema":{"$ref":"#/components/schemas/Error"}}}},"429":{"description":"Request cannot be completed; inspect error.code.","content":{"application/json":{"schema":{"$ref":"#/components/schemas/Error"}}}},"503":{"description":"Request cannot be completed; inspect error.code.","content":{"application/json":{"schema":{"$ref":"#/components/schemas/Error"}}}}}}},"/v1/actions":{"get":{"tags":["Goals"],"summary":"List the small actions attached to goals","responses":{"200":{"description":"Success","content":{"application/json":{"schema":{"$ref":"#/components/schemas/Memory"}}}},"400":{"description":"Request cannot be completed; inspect error.code.","content":{"application/json":{"schema":{"$ref":"#/components/schemas/Error"}}}},"401":{"description":"Request cannot be completed; inspect error.code.","content":{"application/json":{"schema":{"$ref":"#/components/schemas/Error"}}}},"403":{"description":"Request cannot be completed; inspect error.code.","content":{"application/json":{"schema":{"$ref":"#/components/schemas/Error"}}}},"409":{"description":"Request cannot be completed; inspect error.code.","content":{"application/json":{"schema":{"$ref":"#/components/schemas/Error"}}}},"413":{"description":"Request cannot be completed; inspect error.code.","content":{"application/json":{"schema":{"$ref":"#/components/schemas/Error"}}}},"415":{"description":"Request cannot be completed; inspect error.code.","content":{"application/json":{"schema":{"$ref":"#/components/schemas/Error"}}}},"429":{"description":"Request cannot be completed; inspect error.code.","content":{"application/json":{"schema":{"$ref":"#/components/schemas/Error"}}}},"503":{"description":"Request cannot be completed; inspect error.code.","content":{"application/json":{"schema":{"$ref":"#/components/schemas/Error"}}}}}},"post":{"tags":["Goals"],"summary":"Save an action for a saved goal","requestBody":{"required":true,"content":{"application/json":{"schema":{"type":"object","properties":{"goal_id":{"type":"string","format":"uuid"},"text":{"type":"string","minLength":1,"maxLength":2000},"quote":{"type":"string","minLength":1,"maxLength":4000}},"required":["goal_id","text"],"additionalProperties":false}}}},"parameters":[{"$ref":"#/components/parameters/IdempotencyKey"}],"responses":{"201":{"description":"Success","content":{"application/json":{"schema":{"$ref":"#/components/schemas/Receipt"}}}},"400":{"description":"Request cannot be completed; inspect error.code.","content":{"application/json":{"schema":{"$ref":"#/components/schemas/Error"}}}},"401":{"description":"Request cannot be completed; inspect error.code.","content":{"application/json":{"schema":{"$ref":"#/components/schemas/Error"}}}},"403":{"description":"Request cannot be completed; inspect error.code.","content":{"application/json":{"schema":{"$ref":"#/components/schemas/Error"}}}},"409":{"description":"Request cannot be completed; inspect error.code.","content":{"application/json":{"schema":{"$ref":"#/components/schemas/Error"}}}},"413":{"description":"Request cannot be completed; inspect error.code.","content":{"application/json":{"schema":{"$ref":"#/components/schemas/Error"}}}},"415":{"description":"Request cannot be completed; inspect error.code.","content":{"application/json":{"schema":{"$ref":"#/components/schemas/Error"}}}},"429":{"description":"Request cannot be completed; inspect error.code.","content":{"application/json":{"schema":{"$ref":"#/components/schemas/Error"}}}},"503":{"description":"Request cannot be completed; inspect error.code.","content":{"application/json":{"schema":{"$ref":"#/components/schemas/Error"}}}}}}},"/v1/actions/{action_id}/progress":{"post":{"tags":["Goals"],"summary":"Record what the user reports about an action","requestBody":{"required":true,"content":{"application/json":{"schema":{"$ref":"#/components/schemas/ChosenText"}}}},"parameters":[{"name":"action_id","in":"path","required":true,"schema":{"type":"string","format":"uuid"}},{"$ref":"#/components/parameters/IdempotencyKey"}],"responses":{"201":{"description":"Success","content":{"application/json":{"schema":{"$ref":"#/components/schemas/Receipt"}}}},"400":{"description":"Request cannot be completed; inspect error.code.","content":{"application/json":{"schema":{"$ref":"#/components/schemas/Error"}}}},"401":{"description":"Request cannot be completed; inspect error.code.","content":{"application/json":{"schema":{"$ref":"#/components/schemas/Error"}}}},"403":{"description":"Request cannot be completed; inspect error.code.","content":{"application/json":{"schema":{"$ref":"#/components/schemas/Error"}}}},"409":{"description":"Request cannot be completed; inspect error.code.","content":{"application/json":{"schema":{"$ref":"#/components/schemas/Error"}}}},"413":{"description":"Request cannot be completed; inspect error.code.","content":{"application/json":{"schema":{"$ref":"#/components/schemas/Error"}}}},"415":{"description":"Request cannot be completed; inspect error.code.","content":{"application/json":{"schema":{"$ref":"#/components/schemas/Error"}}}},"429":{"description":"Request cannot be completed; inspect error.code.","content":{"application/json":{"schema":{"$ref":"#/components/schemas/Error"}}}},"503":{"description":"Request cannot be completed; inspect error.code.","content":{"application/json":{"schema":{"$ref":"#/components/schemas/Error"}}}}}}},"/v1/visit-questions":{"get":{"tags":["Goals"],"summary":"List saved visit questions","responses":{"200":{"description":"Success","content":{"application/json":{"schema":{"$ref":"#/components/schemas/Memory"}}}},"400":{"description":"Request cannot be completed; inspect error.code.","content":{"application/json":{"schema":{"$ref":"#/components/schemas/Error"}}}},"401":{"description":"Request cannot be completed; inspect error.code.","content":{"application/json":{"schema":{"$ref":"#/components/schemas/Error"}}}},"403":{"description":"Request cannot be completed; inspect error.code.","content":{"application/json":{"schema":{"$ref":"#/components/schemas/Error"}}}},"409":{"description":"Request cannot be completed; inspect error.code.","content":{"application/json":{"schema":{"$ref":"#/components/schemas/Error"}}}},"413":{"description":"Request cannot be completed; inspect error.code.","content":{"application/json":{"schema":{"$ref":"#/components/schemas/Error"}}}},"415":{"description":"Request cannot be completed; inspect error.code.","content":{"application/json":{"schema":{"$ref":"#/components/schemas/Error"}}}},"429":{"description":"Request cannot be completed; inspect error.code.","content":{"application/json":{"schema":{"$ref":"#/components/schemas/Error"}}}},"503":{"description":"Request cannot be completed; inspect error.code.","content":{"application/json":{"schema":{"$ref":"#/components/schemas/Error"}}}}}},"post":{"tags":["Goals"],"summary":"Save a visit question","requestBody":{"required":true,"content":{"application/json":{"schema":{"$ref":"#/components/schemas/ChosenText"}}}},"parameters":[{"$ref":"#/components/parameters/IdempotencyKey"}],"responses":{"201":{"description":"Success","content":{"application/json":{"schema":{"$ref":"#/components/schemas/Receipt"}}}},"400":{"description":"Request cannot be completed; inspect error.code.","content":{"application/json":{"schema":{"$ref":"#/components/schemas/Error"}}}},"401":{"description":"Request cannot be completed; inspect error.code.","content":{"application/json":{"schema":{"$ref":"#/components/schemas/Error"}}}},"403":{"description":"Request cannot be completed; inspect error.code.","content":{"application/json":{"schema":{"$ref":"#/components/schemas/Error"}}}},"409":{"description":"Request cannot be completed; inspect error.code.","content":{"application/json":{"schema":{"$ref":"#/components/schemas/Error"}}}},"413":{"description":"Request cannot be completed; inspect error.code.","content":{"application/json":{"schema":{"$ref":"#/components/schemas/Error"}}}},"415":{"description":"Request cannot be completed; inspect error.code.","content":{"application/json":{"schema":{"$ref":"#/components/schemas/Error"}}}},"429":{"description":"Request cannot be completed; inspect error.code.","content":{"application/json":{"schema":{"$ref":"#/components/schemas/Error"}}}},"503":{"description":"Request cannot be completed; inspect error.code.","content":{"application/json":{"schema":{"$ref":"#/components/schemas/Error"}}}}}}},"/v1/call-preferences":{"get":{"tags":["Calls"],"summary":"Read call preferences","responses":{"200":{"description":"Success","content":{"application/json":{"schema":{"type":"object","additionalProperties":true}}}},"400":{"description":"Request cannot be completed; inspect error.code.","content":{"application/json":{"schema":{"$ref":"#/components/schemas/Error"}}}},"401":{"description":"Request cannot be completed; inspect error.code.","content":{"application/json":{"schema":{"$ref":"#/components/schemas/Error"}}}},"403":{"description":"Request cannot be completed; inspect error.code.","content":{"application/json":{"schema":{"$ref":"#/components/schemas/Error"}}}},"409":{"description":"Request cannot be completed; inspect error.code.","content":{"application/json":{"schema":{"$ref":"#/components/schemas/Error"}}}},"413":{"description":"Request cannot be completed; inspect error.code.","content":{"application/json":{"schema":{"$ref":"#/components/schemas/Error"}}}},"415":{"description":"Request cannot be completed; inspect error.code.","content":{"application/json":{"schema":{"$ref":"#/components/schemas/Error"}}}},"429":{"description":"Request cannot be completed; inspect error.code.","content":{"application/json":{"schema":{"$ref":"#/components/schemas/Error"}}}},"503":{"description":"Request cannot be completed; inspect error.code.","content":{"application/json":{"schema":{"$ref":"#/components/schemas/Error"}}}}}},"put":{"tags":["Calls"],"summary":"Set the person’s preferred call time","description":"Uses the current outbound service and its enabled state. Days use Monday=1 through Sunday=7. The existing service validates its calling window and next occurrence. A calendar preference is not a completed phone call.","requestBody":{"required":true,"content":{"application/json":{"schema":{"type":"object","properties":{"local_time":{"type":"string","pattern":"^\\d{2}:\\d{2}$","example":"09:00"},"timezone":{"type":"string","example":"America/New_York"},"weekdays":{"type":"array","items":{"type":"integer","minimum":1,"maximum":7},"minItems":1,"maxItems":7},"quote":{"type":"string","minLength":1,"maxLength":4000}},"required":["local_time","timezone","weekdays","quote"],"additionalProperties":false}}}},"parameters":[{"$ref":"#/components/parameters/IdempotencyKey"}],"responses":{"200":{"description":"Success","content":{"application/json":{"schema":{"$ref":"#/components/schemas/Receipt"}}}},"400":{"description":"Request cannot be completed; inspect error.code.","content":{"application/json":{"schema":{"$ref":"#/components/schemas/Error"}}}},"401":{"description":"Request cannot be completed; inspect error.code.","content":{"application/json":{"schema":{"$ref":"#/components/schemas/Error"}}}},"403":{"description":"Request cannot be completed; inspect error.code.","content":{"application/json":{"schema":{"$ref":"#/components/schemas/Error"}}}},"409":{"description":"Request cannot be completed; inspect error.code.","content":{"application/json":{"schema":{"$ref":"#/components/schemas/Error"}}}},"413":{"description":"Request cannot be completed; inspect error.code.","content":{"application/json":{"schema":{"$ref":"#/components/schemas/Error"}}}},"415":{"description":"Request cannot be completed; inspect error.code.","content":{"application/json":{"schema":{"$ref":"#/components/schemas/Error"}}}},"429":{"description":"Request cannot be completed; inspect error.code.","content":{"application/json":{"schema":{"$ref":"#/components/schemas/Error"}}}},"503":{"description":"Request cannot be completed; inspect error.code.","content":{"application/json":{"schema":{"$ref":"#/components/schemas/Error"}}}}}}},"/v1/call-preferences/pause":{"post":{"tags":["Calls"],"summary":"Pause proactive calls","requestBody":{"required":true,"content":{"application/json":{"schema":{"type":"object","properties":{"quote":{"type":"string","minLength":1,"maxLength":4000}},"required":["quote"],"additionalProperties":false}}}},"parameters":[{"$ref":"#/components/parameters/IdempotencyKey"}],"responses":{"200":{"description":"Success","content":{"application/json":{"schema":{"$ref":"#/components/schemas/Receipt"}}}},"400":{"description":"Request cannot be completed; inspect error.code.","content":{"application/json":{"schema":{"$ref":"#/components/schemas/Error"}}}},"401":{"description":"Request cannot be completed; inspect error.code.","content":{"application/json":{"schema":{"$ref":"#/components/schemas/Error"}}}},"403":{"description":"Request cannot be completed; inspect error.code.","content":{"application/json":{"schema":{"$ref":"#/components/schemas/Error"}}}},"409":{"description":"Request cannot be completed; inspect error.code.","content":{"application/json":{"schema":{"$ref":"#/components/schemas/Error"}}}},"413":{"description":"Request cannot be completed; inspect error.code.","content":{"application/json":{"schema":{"$ref":"#/components/schemas/Error"}}}},"415":{"description":"Request cannot be completed; inspect error.code.","content":{"application/json":{"schema":{"$ref":"#/components/schemas/Error"}}}},"429":{"description":"Request cannot be completed; inspect error.code.","content":{"application/json":{"schema":{"$ref":"#/components/schemas/Error"}}}},"503":{"description":"Request cannot be completed; inspect error.code.","content":{"application/json":{"schema":{"$ref":"#/components/schemas/Error"}}}}}}},"/v1/records":{"get":{"tags":["Records"],"summary":"Read the relevant imported record subset","description":"Reads the existing Fasten-backed store. It does not create a live health-system connection. Preserve the returned mode and source in the app.","parameters":[{"name":"category","in":"query","schema":{"type":"string","enum":["all","labs","medications","conditions","allergies","careplan"],"default":"all"}},{"name":"query","in":"query","schema":{"type":"string","maxLength":200}}],"responses":{"200":{"description":"Success","content":{"application/json":{"schema":{"type":"object","additionalProperties":true}}}},"400":{"description":"Request cannot be completed; inspect error.code.","content":{"application/json":{"schema":{"$ref":"#/components/schemas/Error"}}}},"401":{"description":"Request cannot be completed; inspect error.code.","content":{"application/json":{"schema":{"$ref":"#/components/schemas/Error"}}}},"403":{"description":"Request cannot be completed; inspect error.code.","content":{"application/json":{"schema":{"$ref":"#/components/schemas/Error"}}}},"409":{"description":"Request cannot be completed; inspect error.code.","content":{"application/json":{"schema":{"$ref":"#/components/schemas/Error"}}}},"413":{"description":"Request cannot be completed; inspect error.code.","content":{"application/json":{"schema":{"$ref":"#/components/schemas/Error"}}}},"415":{"description":"Request cannot be completed; inspect error.code.","content":{"application/json":{"schema":{"$ref":"#/components/schemas/Error"}}}},"429":{"description":"Request cannot be completed; inspect error.code.","content":{"application/json":{"schema":{"$ref":"#/components/schemas/Error"}}}},"503":{"description":"Request cannot be completed; inspect error.code.","content":{"application/json":{"schema":{"$ref":"#/components/schemas/Error"}}}}}}},"/v1/connections":{"get":{"tags":["Connections"],"summary":"Check this user’s Google connection status","responses":{"200":{"description":"Success","content":{"application/json":{"schema":{"type":"object","additionalProperties":true}}}},"400":{"description":"Request cannot be completed; inspect error.code.","content":{"application/json":{"schema":{"$ref":"#/components/schemas/Error"}}}},"401":{"description":"Request cannot be completed; inspect error.code.","content":{"application/json":{"schema":{"$ref":"#/components/schemas/Error"}}}},"403":{"description":"Request cannot be completed; inspect error.code.","content":{"application/json":{"schema":{"$ref":"#/components/schemas/Error"}}}},"409":{"description":"Request cannot be completed; inspect error.code.","content":{"application/json":{"schema":{"$ref":"#/components/schemas/Error"}}}},"413":{"description":"Request cannot be completed; inspect error.code.","content":{"application/json":{"schema":{"$ref":"#/components/schemas/Error"}}}},"415":{"description":"Request cannot be completed; inspect error.code.","content":{"application/json":{"schema":{"$ref":"#/components/schemas/Error"}}}},"429":{"description":"Request cannot be completed; inspect error.code.","content":{"application/json":{"schema":{"$ref":"#/components/schemas/Error"}}}},"503":{"description":"Request cannot be completed; inspect error.code.","content":{"application/json":{"schema":{"$ref":"#/components/schemas/Error"}}}}}}},"/v1/connections/{service}":{"post":{"tags":["Connections"],"summary":"Create a Google connection link for this user","description":"Open the returned URL in the app’s browser. Each person connects their own account. Recheck status after authorization.","requestBody":{"required":true,"content":{"application/json":{"schema":{"type":"object","properties":{},"required":[],"additionalProperties":false}}}},"parameters":[{"name":"service","in":"path","required":true,"schema":{"type":"string","enum":["calendar","tasks","drive"]}}],"responses":{"200":{"description":"Success","content":{"application/json":{"schema":{"type":"object","additionalProperties":true}}}},"400":{"description":"Request cannot be completed; inspect error.code.","content":{"application/json":{"schema":{"$ref":"#/components/schemas/Error"}}}},"401":{"description":"Request cannot be completed; inspect error.code.","content":{"application/json":{"schema":{"$ref":"#/components/schemas/Error"}}}},"403":{"description":"Request cannot be completed; inspect error.code.","content":{"application/json":{"schema":{"$ref":"#/components/schemas/Error"}}}},"409":{"description":"Request cannot be completed; inspect error.code.","content":{"application/json":{"schema":{"$ref":"#/components/schemas/Error"}}}},"413":{"description":"Request cannot be completed; inspect error.code.","content":{"application/json":{"schema":{"$ref":"#/components/schemas/Error"}}}},"415":{"description":"Request cannot be completed; inspect error.code.","content":{"application/json":{"schema":{"$ref":"#/components/schemas/Error"}}}},"429":{"description":"Request cannot be completed; inspect error.code.","content":{"application/json":{"schema":{"$ref":"#/components/schemas/Error"}}}},"503":{"description":"Request cannot be completed; inspect error.code.","content":{"application/json":{"schema":{"$ref":"#/components/schemas/Error"}}}}}}},"/v1/connected-actions":{"post":{"tags":["Connections"],"summary":"Read, propose or confirm a supported Google action","description":"Read: week, free_slots, list_tasks or list_folders. Propose: add_task, complete_task, add_calendar_plan or save_guide. Proposals require Idempotency-Key. Confirm the returned action_id with confirmed:true and the user’s quote. An uncertain result must be reconciled with the provider before retrying.","requestBody":{"required":true,"content":{"application/json":{"schema":{"$ref":"#/components/schemas/ConnectedAction"}}}},"parameters":[{"name":"Idempotency-Key","in":"header","required":false,"schema":{"type":"string","minLength":1,"maxLength":120}}],"responses":{"200":{"description":"Success","content":{"application/json":{"schema":{"type":"object","additionalProperties":true}}}},"400":{"description":"Request cannot be completed; inspect error.code.","content":{"application/json":{"schema":{"$ref":"#/components/schemas/Error"}}}},"401":{"description":"Request cannot be completed; inspect error.code.","content":{"application/json":{"schema":{"$ref":"#/components/schemas/Error"}}}},"403":{"description":"Request cannot be completed; inspect error.code.","content":{"application/json":{"schema":{"$ref":"#/components/schemas/Error"}}}},"409":{"description":"Request cannot be completed; inspect error.code.","content":{"application/json":{"schema":{"$ref":"#/components/schemas/Error"}}}},"413":{"description":"Request cannot be completed; inspect error.code.","content":{"application/json":{"schema":{"$ref":"#/components/schemas/Error"}}}},"415":{"description":"Request cannot be completed; inspect error.code.","content":{"application/json":{"schema":{"$ref":"#/components/schemas/Error"}}}},"429":{"description":"Request cannot be completed; inspect error.code.","content":{"application/json":{"schema":{"$ref":"#/components/schemas/Error"}}}},"503":{"description":"Request cannot be completed; inspect error.code.","content":{"application/json":{"schema":{"$ref":"#/components/schemas/Error"}}}}}}},"/v1/messaging/status":{"get":{"tags":["Messaging"],"summary":"Check whether this user has a connected Rumi message thread","responses":{"200":{"description":"Success","content":{"application/json":{"schema":{"type":"object","properties":{"status":{"type":"string","enum":["connected","connection_needed"]}},"required":[],"additionalProperties":false}}}},"400":{"description":"Request cannot be completed; inspect error.code.","content":{"application/json":{"schema":{"$ref":"#/components/schemas/Error"}}}},"401":{"description":"Request cannot be completed; inspect error.code.","content":{"application/json":{"schema":{"$ref":"#/components/schemas/Error"}}}},"403":{"description":"Request cannot be completed; inspect error.code.","content":{"application/json":{"schema":{"$ref":"#/components/schemas/Error"}}}},"409":{"description":"Request cannot be completed; inspect error.code.","content":{"application/json":{"schema":{"$ref":"#/components/schemas/Error"}}}},"413":{"description":"Request cannot be completed; inspect error.code.","content":{"application/json":{"schema":{"$ref":"#/components/schemas/Error"}}}},"415":{"description":"Request cannot be completed; inspect error.code.","content":{"application/json":{"schema":{"$ref":"#/components/schemas/Error"}}}},"429":{"description":"Request cannot be completed; inspect error.code.","content":{"application/json":{"schema":{"$ref":"#/components/schemas/Error"}}}},"503":{"description":"Request cannot be completed; inspect error.code.","content":{"application/json":{"schema":{"$ref":"#/components/schemas/Error"}}}}}}},"/v1/messages":{"post":{"tags":["Messaging"],"summary":"Send a note to this user’s own Rumi message thread","description":"This sends a note through the existing Photon outbox. It is not an AI chat turn. No recipient field is accepted. queued/sent indicates queue/provider acceptance, not delivery/read proof. For an AI reply, use a text conversation.","requestBody":{"required":true,"content":{"application/json":{"schema":{"type":"object","properties":{"text":{"type":"string","minLength":1,"maxLength":12000}},"required":["text"],"additionalProperties":false}}}},"parameters":[{"$ref":"#/components/parameters/IdempotencyKey"}],"responses":{"202":{"description":"Success","content":{"application/json":{"schema":{"$ref":"#/components/schemas/Receipt"}}}},"400":{"description":"Request cannot be completed; inspect error.code.","content":{"application/json":{"schema":{"$ref":"#/components/schemas/Error"}}}},"401":{"description":"Request cannot be completed; inspect error.code.","content":{"application/json":{"schema":{"$ref":"#/components/schemas/Error"}}}},"403":{"description":"Request cannot be completed; inspect error.code.","content":{"application/json":{"schema":{"$ref":"#/components/schemas/Error"}}}},"409":{"description":"Request cannot be completed; inspect error.code.","content":{"application/json":{"schema":{"$ref":"#/components/schemas/Error"}}}},"413":{"description":"Request cannot be completed; inspect error.code.","content":{"application/json":{"schema":{"$ref":"#/components/schemas/Error"}}}},"415":{"description":"Request cannot be completed; inspect error.code.","content":{"application/json":{"schema":{"$ref":"#/components/schemas/Error"}}}},"429":{"description":"Request cannot be completed; inspect error.code.","content":{"application/json":{"schema":{"$ref":"#/components/schemas/Error"}}}},"503":{"description":"Request cannot be completed; inspect error.code.","content":{"application/json":{"schema":{"$ref":"#/components/schemas/Error"}}}}}}},"/v1/conversations":{"get":{"tags":["Conversations"],"summary":"List this user’s app conversations","responses":{"200":{"description":"Success","content":{"application/json":{"schema":{"type":"object","properties":{"status":{"type":"string"},"items":{"type":"array","items":{"type":"object","properties":{"conversation_id":{"type":"string"},"mode":{"type":"string","enum":["text","voice"]},"created_at":{"type":"string","format":"date-time"},"closed_at":{"type":["string","null"],"format":"date-time"}},"required":[],"additionalProperties":false}}},"required":[],"additionalProperties":false}}}},"400":{"description":"Request cannot be completed; inspect error.code.","content":{"application/json":{"schema":{"$ref":"#/components/schemas/Error"}}}},"401":{"description":"Request cannot be completed; inspect error.code.","content":{"application/json":{"schema":{"$ref":"#/components/schemas/Error"}}}},"403":{"description":"Request cannot be completed; inspect error.code.","content":{"application/json":{"schema":{"$ref":"#/components/schemas/Error"}}}},"409":{"description":"Request cannot be completed; inspect error.code.","content":{"application/json":{"schema":{"$ref":"#/components/schemas/Error"}}}},"413":{"description":"Request cannot be completed; inspect error.code.","content":{"application/json":{"schema":{"$ref":"#/components/schemas/Error"}}}},"415":{"description":"Request cannot be completed; inspect error.code.","content":{"application/json":{"schema":{"$ref":"#/components/schemas/Error"}}}},"429":{"description":"Request cannot be completed; inspect error.code.","content":{"application/json":{"schema":{"$ref":"#/components/schemas/Error"}}}},"503":{"description":"Request cannot be completed; inspect error.code.","content":{"application/json":{"schema":{"$ref":"#/components/schemas/Error"}}}}}},"post":{"tags":["Conversations"],"summary":"Start an ElevenLabs text or voice session with shared Rumi context","description":"Pass sdk_options to @elevenlabs/client Conversation.startSession or the matching framework SDK. The backend reserves the provider conversation ID first and binds it to this Rumi user. Your app receives no provider master key. Keep the returned session credential out of logs and public URLs.","requestBody":{"required":true,"content":{"application/json":{"schema":{"type":"object","properties":{"mode":{"type":"string","enum":["text","voice"]}},"required":["mode"],"additionalProperties":false}}}},"responses":{"201":{"description":"Success","content":{"application/json":{"schema":{"$ref":"#/components/schemas/Conversation"}}}},"400":{"description":"Request cannot be completed; inspect error.code.","content":{"application/json":{"schema":{"$ref":"#/components/schemas/Error"}}}},"401":{"description":"Request cannot be completed; inspect error.code.","content":{"application/json":{"schema":{"$ref":"#/components/schemas/Error"}}}},"403":{"description":"Request cannot be completed; inspect error.code.","content":{"application/json":{"schema":{"$ref":"#/components/schemas/Error"}}}},"409":{"description":"Request cannot be completed; inspect error.code.","content":{"application/json":{"schema":{"$ref":"#/components/schemas/Error"}}}},"413":{"description":"Request cannot be completed; inspect error.code.","content":{"application/json":{"schema":{"$ref":"#/components/schemas/Error"}}}},"415":{"description":"Request cannot be completed; inspect error.code.","content":{"application/json":{"schema":{"$ref":"#/components/schemas/Error"}}}},"429":{"description":"Request cannot be completed; inspect error.code.","content":{"application/json":{"schema":{"$ref":"#/components/schemas/Error"}}}},"503":{"description":"Request cannot be completed; inspect error.code.","content":{"application/json":{"schema":{"$ref":"#/components/schemas/Error"}}}}}}},"/v1/conversations/{conversation_id}":{"get":{"tags":["Conversations"],"summary":"Read this user’s retained app conversation transcript","description":"Requires current memory permission and an app conversation owned by this Rumi user and app integration. Returns only message text and timing. Provider retention and transcript processing apply.","parameters":[{"name":"conversation_id","in":"path","required":true,"schema":{"type":"string","maxLength":200}}],"responses":{"200":{"description":"Success","content":{"application/json":{"schema":{"type":"object","properties":{"conversation_id":{"type":"string"},"status":{"type":"string"},"duration_seconds":{"type":["number","null"]},"transcript":{"type":"array","items":{"type":"object","properties":{"role":{"type":"string","enum":["user","agent"]},"message":{"type":"string"},"time_in_call_secs":{"type":"number"}},"required":[],"additionalProperties":false}}},"required":[],"additionalProperties":false}}}},"400":{"description":"Request cannot be completed; inspect error.code.","content":{"application/json":{"schema":{"$ref":"#/components/schemas/Error"}}}},"401":{"description":"Request cannot be completed; inspect error.code.","content":{"application/json":{"schema":{"$ref":"#/components/schemas/Error"}}}},"403":{"description":"Request cannot be completed; inspect error.code.","content":{"application/json":{"schema":{"$ref":"#/components/schemas/Error"}}}},"409":{"description":"Request cannot be completed; inspect error.code.","content":{"application/json":{"schema":{"$ref":"#/components/schemas/Error"}}}},"413":{"description":"Request cannot be completed; inspect error.code.","content":{"application/json":{"schema":{"$ref":"#/components/schemas/Error"}}}},"415":{"description":"Request cannot be completed; inspect error.code.","content":{"application/json":{"schema":{"$ref":"#/components/schemas/Error"}}}},"429":{"description":"Request cannot be completed; inspect error.code.","content":{"application/json":{"schema":{"$ref":"#/components/schemas/Error"}}}},"503":{"description":"Request cannot be completed; inspect error.code.","content":{"application/json":{"schema":{"$ref":"#/components/schemas/Error"}}}}}}}},"components":{"securitySchemes":{"AppId":{"type":"apiKey","in":"header","name":"x-rumi-app-id","description":"Public app integration ID."},"Bearer":{"type":"http","scheme":"bearer","description":"User access token returned by login."},"ServerKey":{"type":"apiKey","in":"header","name":"x-rumi-server-key","description":"Private key for your trusted backend only. Never ship it in the app."}},"parameters":{"IdempotencyKey":{"name":"Idempotency-Key","in":"header","required":true,"schema":{"type":"string","minLength":1,"maxLength":120},"description":"A unique ID for this exact write. Reuse only for an identical retry."}},"schemas":{"Error":{"type":"object","properties":{"error":{"type":"object","properties":{"code":{"type":"string"}},"required":["code"],"additionalProperties":false}},"required":["error"],"additionalProperties":false},"Receipt":{"type":"object","properties":{"status":{"type":"string"},"committed":{"type":["boolean","null"]},"receipt_id":{"type":"string","format":"uuid"},"item_id":{"type":["string","null"]},"state_version":{"type":"integer"}},"additionalProperties":true},"Config":{"type":"object","properties":{"api_version":{"type":"string"},"app_id":{"type":"string","format":"uuid"},"brand":{"type":"string"},"voice_number":{"type":"string"},"messaging_number":{"type":"string"},"records_mode":{"type":"string","enum":["test","live"]}},"additionalProperties":true},"Session":{"type":"object","properties":{"status":{"type":"string"},"user_id":{"type":"string","format":"uuid"},"session_id":{"type":"string","format":"uuid"},"token_type":{"const":"Bearer"},"access_token":{"type":"string","pattern":"^[a-f0-9]{64}$"},"refresh_token":{"type":"string","pattern":"^[a-f0-9]{64}$"},"expires_at":{"type":"string","format":"date-time"},"refresh_expires_at":{"type":"string","format":"date-time"}},"required":["user_id","session_id","access_token","refresh_token","expires_at"],"additionalProperties":false},"Challenge":{"type":"object","properties":{"challenge_id":{"type":"string","format":"uuid"},"status":{"type":"string"},"delivered":{"type":"boolean"},"expires_in":{"type":"integer"},"messaging_number":{"type":"string"}},"required":["challenge_id","status"],"additionalProperties":false},"ChosenText":{"type":"object","properties":{"text":{"type":"string","minLength":1,"maxLength":2000},"quote":{"type":"string","minLength":1,"maxLength":4000}},"required":["text"],"additionalProperties":false},"Memory":{"type":"object","properties":{"status":{"type":"string"},"memory_consent":{"type":"string"},"preferred_name":{"type":["string","null"]},"memory_brief":{"type":"object"},"conversation_plan":{"type":"object"},"items":{"type":"array","items":{"type":"object","properties":{"id":{"type":"string","format":"uuid"},"parent_id":{"type":["string","null"]},"kind":{"type":"string"},"body":{"type":"object","properties":{"text":{"type":"string"}},"required":[],"additionalProperties":false},"status":{"type":"string"}}}}},"additionalProperties":true},"Conversation":{"type":"object","properties":{"conversation_id":{"type":"string"},"mode":{"type":"string","enum":["text","voice"]},"user_id":{"type":"string","format":"uuid"},"expires_in":{"type":"integer"},"sdk_options":{"type":"object","properties":{"signedUrl":{"type":"string","format":"uri"},"connectionType":{"const":"websocket"},"userId":{"type":"string","format":"uuid"},"textOnly":{"type":"boolean"},"overrides":{"type":"object"},"dynamicVariables":{"type":"object","additionalProperties":true}},"required":["signedUrl","dynamicVariables"],"additionalProperties":false}},"required":["conversation_id","mode","sdk_options"],"additionalProperties":false},"ConnectedAction":{"type":"object","properties":{"operation":{"type":"string","enum":["read","propose","confirm","send_link"]},"action":{"type":"string","enum":["week","free_slots","list_tasks","list_folders","add_task","complete_task","add_calendar_plan","save_guide"]},"action_id":{"type":"string","format":"uuid"},"confirmed":{"type":"boolean"},"quote":{"type":"string","minLength":1,"maxLength":4000},"title":{"type":"string","maxLength":200},"notes":{"type":"string","maxLength":2000},"day":{"type":"string","format":"date"},"task_id":{"type":"string"},"tasklist_id":{"type":"string"},"folder_id":{"type":"string"},"content":{"type":"string","maxLength":10000},"start":{"type":"string","format":"date-time"},"end":{"type":"string","format":"date-time"},"timezone":{"type":"string"},"local_start":{"type":"string"},"service":{"type":"string","enum":["googlecalendar","googletasks","googledrive"]},"channel":{"const":"imessage"}},"required":["operation"],"additionalProperties":false}}},"servers":[{"url":"https://egoicdonmuudwvbsockm.supabase.co/functions/v1/rumi-app-api"}]}diff --git a/integrations/rumi-app-api/public-checks.json b/integrations/rumi-app-api/public-checks.json
+new file mode 100644
+--- /dev/null
++++ b/integrations/rumi-app-api/public-checks.json
+@@ -0,0 +1,58 @@
++{
++  "spec_sha256": "05393d3a2d03dee6bf3812edafb435abf235cde07cb95b9f9a1b820cf5096dea",
++  "tested_documented_origin": "https://egoicdonmuudwvbsockm.supabase.co/functions/v1/rumi-app-api",
++  "checks": [
++    {
++      "path": "/health",
++      "expected_status": 200,
++      "actual_status": 200
++    },
++    {
++      "path": "/v1/config",
++      "expected_status": 200,
++      "actual_status": 200
++    },
++    {
++      "path": "/v1/me",
++      "expected_status": 401,
++      "actual_status": 401
++    },
++    {
++      "path": "/v1/context",
++      "expected_status": 401,
++      "actual_status": 401
++    },
++    {
++      "path": "/v1/memory",
++      "expected_status": 401,
++      "actual_status": 401
++    },
++    {
++      "path": "/v1/goals",
++      "expected_status": 401,
++      "actual_status": 401
++    },
++    {
++      "path": "/v1/records",
++      "expected_status": 401,
++      "actual_status": 401
++    },
++    {
++      "path": "/v1/conversations",
++      "expected_status": 401,
++      "actual_status": 401
++    },
++    {
++      "path": "/v1/me",
++      "expected_status": 401,
++      "actual_status": 401
++    }
++  ],
++  "authenticated_acceptance": "not performed",
++  "mutations_sent": false,
++  "supabase_servers": [
++    {
++      "url": "http://egoicdonmuudwvbsockm.supabase.co/rumi-app-api"
++    }
++  ]
++}
+diff --git a/integrations/rumi-app-api/PORTING_HANDOFF.md b/integrations/rumi-app-api/PORTING_HANDOFF.md
+new file mode 100644
+--- /dev/null
++++ b/integrations/rumi-app-api/PORTING_HANDOFF.md
+@@ -0,0 +1,120 @@
++# Rumi insights and existing App API: collaborator handoff
++
++Prepared October 29, 2026. Scope: the simplified native `ios-rumi` app, not the larger `ios` or `web` UI. Preserve the designer's chat-first navigation, menu, Health screens and mint/forest-green styling. This is a portable implementation, not a claim of production activation or complete backend-PR parity.
++
++## 1. Sources and provenance
++
++- PR attachment: https://r2-pub.rork.com/attachments/7ccpbnhcs83uypksx8wno.pdf — 23-page summary/review of `amalgam-rx/aiservice_chat_server` PR #62, **AIAS-45 Clinical insights, care follow-ups and coaching after a data answer**, `insights-tools` into `master`, 43 commits. It describes 73 changed files but does not contain that full source diff. The behavior was implemented natively; no unseen Python implementation was copied or claimed merged.
++- Swagger UI: https://rumi-api-amber.vercel.app/
++- Snapshotted specification: https://rumi-api-amber.vercel.app/openapi.json
++- Alternate specification: https://egoicdonmuudwvbsockm.supabase.co/functions/v1/rumi-app-api/openapi.json
++- `openapi.json` in this directory is the published Swagger variant. SHA-256: `05393d3a2d03dee6bf3812edafb435abf235cde07cb95b9f9a1b820cf5096dea`.
++- Important discrepancy: Swagger advertises HTTPS `https://egoicdonmuudwvbsockm.supabase.co/functions/v1/rumi-app-api`; the Supabase-hosted spec advertises HTTP and omits `/functions/v1`. Their paths/components matched in the public checks. Never adopt the HTTP URL. Owner confirmation is required before app activation; a documentation origin is not automatically an API base URL.
++- Requested source tree: https://github.com/aahalife/rumi/tree/main/backend/app-api. Its new contents were unavailable to this workspace; raw README lookup returned 404. The local `linked/rumi` snapshot remains `da7fdc4dca5f1913a35bd17deedff12824f0fc1d`, not a verified copy of that new API source. Do not infer its internals from the contract.
++- Existing portable destination: https://github.com/aahalife/rork-rumi-research-preview at unchanged baseline `2a6a5e0`. This is distinct from the production backend repository.
++
++## 2. Product behavior delivered
++
++From onboarding, select the **Primary demo member**, Maria or Tom, then Start demo. From an empty demo chat, open **Insights walkthrough**. It offers real Sonnet request buttons plus an explicitly separate **Calculated preview · No AI request**. Preview is a deterministic chart, never a prerecorded model reply. Existing messages can retain chart cards after relaunch.
++
++Example live requests:
++
++- Primary: “Show my A1c and eGFR side by side, and also my latest LDL.”
++- Maria: “Show my A1c and weight side by side.”
++- Tom: “Show my steps and sleep side by side over the last 14 days.”
++- “Show my last 4 A1c results. If fewer exist, show only those available.”
++- “Compare my A1c with people like me and show my CGM time in range.” This must disclose missing data, not fabricate a comparison or CGM result.
++
++A data reply contains app-calculated dated facts and inline charts, then one invitation to discuss a goal. Accepting with Yes/Yes please/Sure/Okay/Ok generates the labelled host question, “What would you like to work toward, in your own words?” Subsequent free-form conversation uses Sonnet. Plain number mentions and device trouble are not automatically data requests. No unsolicited advice is authorized by accepting an invitation.
++
++Care follow-ups are **seeded local rehearsals**, not active orders imported from the API. Refill, referral and lab questions open an exact-question/selected-answer review. Confirmation writes a local unsent receipt only; Cancel writes none. No drug is discontinued, provider searched, referral created, lab ordered/booked, calendar accessed or message sent. Reviews are bound to member and revision.
++
++## 3. Dependency and ownership map
++
++- `ios-rumi/Rumi/DemoInsights.swift`: metric/query/observation/series/card contracts, deterministic `DemoInsightEngine`, native Swift Charts, walkthrough and care rehearsals. Depends on the existing demo session/member, theme and receipt interfaces. Uses platform SwiftUI/Charts only.
++- `ios-rumi/Rumi/DemoMode.swift`: isolated member session and persisted demo turns, supplied-prompt overrides, exact model request, tool registration/validation, host facts/coaching, inline card placement and walkthrough routing. Existing trends now consume the same observations as insight cards.
++- `ios-rumi/Rumi/DemoServices.swift`: previously implemented profile summaries and local service mock journeys; remains the profile/member dependency. Do not replace these with production records implicitly.
++- `ios-rumi/Rumi/RumiAppAPI.swift`: independent verified-user API adapter. No demo observations, legacy Companion tokens or provider keys are used by it.
++- `ios-rumi/Rumi/RumiAppAPIView.swift`: confirmed settings, health/config checks, verified phone challenge, read-only resource inspection, memory and exact real-goal review.
++- `ios-rumi/Rumi/CompanionService.swift`: adds Account → “Rumi App API · Verified account”. The older Companion connection remains a distinct integration path, not silently migrated.
++- `ios-rumi/RumiTests/RumiInsightsTests.swift`: deterministic facts, query bounds, intent and contract tests.
++- `ios-rumi/RumiTests/RumiAPITransportTests.swift`: injected URLProtocol HTTP transport, coalesced refresh, rotated token use, error redaction and token validation tests. No real account requests.
++- `ios-rumi/RumiUITests/RumiInsightsUITests.swift`: actual simulator interactions for primary preview/accessibility values and care cancellation.
++- `tools/verify-rumi-app-api.py`: reproducible public read-only checks and specification/report refresh; no login challenge, personal session or write operation.
++- `tools/export-rumi-works.py`: explicit allowlist portable patch exporter. It does not commit, push, merge or deploy.
++
++The synchronized Xcode target folders automatically include Swift files. Current app deployment target is iOS 26; build service reports Xcode 27.1, Swift 5 language setting, default MainActor isolation. Do not assume the larger app's deployment settings apply. Preserve the destination's own supported availability guards if porting lower.
++
++## 4. Query contract and calculation boundary
++
++`DemoInsightQuery` has `operation`, `metrics`, optional `days`, optional `count`. Operations: `latest`, `trend`, `lastN`, `sideBySide`, `cohort`, `timeInRange`. Metric raw values: `HbA1c`, `LDL-C`, `eGFR`, `Weight`, `Sleep`, `Activity`, `BMI`, `CGM glucose`, `Time in range`.
++
++Tool name: `read_demo_insights`. Arguments are exactly `{"requests":[{"operation":"trend","metrics":["HbA1c"]}]}`. Up to four queries; one metric except exactly two for sideBySide; unique metrics; days 1–3650, count 1–20; lastN requires count; timeInRange requires the Time in range metric. Unknown keys including patient IDs, model-supplied values and dates are rejected. Unknown metric names and empty envelopes fail closed. All queries validate before any card is appended.
++
++The recognized explicit-data intent gate forces this tool using `tool_choice`; a missing tool call fails instead of displaying unverified numbers. Unexpected lookup calls outside the gate also fail. Sonnet chooses queries only. Model narration accompanying insight calls is discarded; the host computes and publishes numerical sentences and chart points. Multiple cards preserve independent dates and units, without causal/correlation claims. Nonvoice history includes calculated facts and guided coaching so subsequent turns can retain continuity. This is non-streaming tool selection with local progress labels, **not** implementation of the PR's backend `Insight`/`Status` event transport.
++
++Clinical policy: **describe, never assess**. No good/bad, normal/abnormal, better/worse, inferred causes, invented reference ranges, targets, demographic percentiles or model-calculated numbers. A1c first-to-last change uses percentage points, not relative percent. Ordinary chat/voice policy is prompt-enforced rather than a proof of universal clinical safety; live-model safety evaluation remains required. The deterministic boundary protects the specific data-card path, not all possible natural-language model output.
++
++## 5. Data, state and accessibility invariants
++
++- Primary: supplied fictional A1c 9 → 8.8%, LDL 130 → 130 mg/dL, eGFR 60 → 55 mL/min/1.73 m². No name, age, weight, height or adherence invented. Chart offsets 270/70 days are explicitly illustrative, not actual lab dates.
++- Maria: A1c 8.6 → synthetic intermediate 8.2 → 7.8%; weights 216.7 → synthetic intermediates 214.2/211.4 → 208.7 lb. Her independent fictional insulin/semaglutide orders remain separate from calculations and never derive from them.
++- Tom: A1c 5.8%, sample weights 228 → 226.5 → 225.8 → 224 lb, 14 days of sleep/activity around 6.4 hours/4,800 steps. No Maria diabetes/insulin/GLP-1 context.
++- No installed BMI, CGM, TIR or cohort dataset. Missing observations are not zeros. Requesting more results than available reports the shortfall. No height, threshold or synthetic comparison is substituted.
++- Saved per-member anchor dates prevent fixtures moving every reopen. 30d/90d/All chart filters act on the returned query observations; All means all observations returned by that query, not an implicit new query. A query already constrained to 30 days may remain empty; submit an unconstrained query to widen it.
++- Drag selects nearest returned point; independent side-by-side charts keep their units/axes. Large values, source/limitation text and expandable date/value rows support nonvisual access. Explicit accessibility containment keeps chart focus values reachable inside native List rows. Values honor device locale, including decimal commas.
++- `DemoTurn.insights` and `invitesGoal` are optional Codable additions; old stored turns decode. The existing `rumi.isolated-demo.v1` per-member persistence remains, not a production database.
++- Member/revision guards suppress late demo replies; switching/resetting ends pending work and invalidates care review. Never populate these stores from verified live account data. Do not promise encryption of UserDefaults demo fixtures.
++
++## 6. Existing App API integration
++
++### Supported now
++
++Settings require confirmed full HTTPS base path and UUID public AppId. Requests preserve `/functions/v1/rumi-app-api`, add `x-rumi-app-id`, use per-user Bearer after verification and attach `Idempotency-Key` for reviewed goal saves. No `x-rumi-server-key` is ever sent from the app. The trusted-backend `/v1/auth/exchange` route is intentionally not exposed.
++
++- Public `GET /health`, app-scoped `GET /v1/config`.
++- Phone `POST /v1/auth/challenges`, resend and six-digit verify. `imessage_connection_needed` is disclosed; requesting a challenge does not prove ownership. Resending does not extend its original expiry. No phone challenge was sent during public checks.
++- Keychain access/refresh session, `WhenUnlockedThisDeviceOnly`; nonsecret configuration in UserDefaults. No session token output in logs or handoff. Strict 64-character lowercase hex token validation.
++- Expiring sessions use one coalesced refresh task; concurrent readers use the rotated token. Identity/version guards reject results after configuration/account changes; local disconnect cancels refresh. Failed refresh disconnects rather than silently using stale credentials. No blind replay of writes after 401.
++- Ephemeral, no-cache/no-cookie production URLSession; redirects denied to protect authorization headers. Raw server error bodies are not displayed.
++- Read profile, context, records, memory, goals, actions, visit-questions, call-preferences, connections, messaging/status and conversations. Loosely specified payloads use `RumiJSON`, preserving fields without interpreting medical meaning. This is a response inspector, not a completed records-to-charts adapter.
++- Read memory and allow exact goal review only when returned permission is `granted`. `POST /v1/goals` sends text/quote with a per-review UUID. Success requires `committed == true`; HTTP 200/status ok/null committed is not proof. An uncertain result warns to inspect saved goals before retrying. Local cancellation cannot roll back a request already accepted upstream.
++- Logout through the service or clearly separate local Keychain removal. Local removal does not revoke remote sessions or pause calls.
++
++### Explicitly not connected
++
++New App API ElevenLabs signed-session playback/text chat; PR event streaming; live care/referral/lab actions; provider searches/bookings; consent-change/record import/action-completion/call-preference writes; historical transcript synchronization; server-only credential exchange. The existing demo voice is GPT-Realtime 2, not new App API ElevenLabs acceptance. The published contract has no Insight/Status schema to map directly.
++
++The demo blocks new App API requests/configuration and checks the guard again after transport completes. This does not undo a real write already dispatched before demo entry. UI identity/disappearance cleanup prevents stale response presentation; broader lifecycle/hostile-race acceptance remains open. Response-size checks occur after URLSession receives the body, not as a streaming memory ceiling. Goal uncertainty is UI state, not a durable cross-install transaction ledger; production retry/reconciliation deserves backend-supported receipt lookup.
++
++No new backend, migration, provider change or infrastructure deployment was performed for this integration. Earlier `/companion/*` routes and migration tooling are historical/optional; **do not deploy or apply them merely to use the published App API**.
++
++## 7. Validation evidence and limits
++
++- Latest native automated run: **25 passed, 0 failed** via supported `swiftTest`, including existing tests, deterministic/query safety tests, mocked HTTP tests and two native UI tests. It exercised primary walkthrough navigation, 8.8% focus value and expanded earlier 9% values, plus exact care review and cancellation. The initial UI assertion exposed inaccessible List grouping, fixed with explicit containment; a later assertion was corrected to honor device decimal-comma formatting.
++- API mocked transport verified concurrent reads refresh only once and use the rotated token, non-2xx response bodies do not leak into user errors, and malformed session tokens do not authenticate. This is not live token rotation proof.
++- Public contract run: **7 checks passed** (`python3 tools/verify-rumi-app-api.py`). Health and config returned 200 with the Swagger-published public app ID; me/context/memory/goals/records/conversations all returned 401 without a user token; missing app ID returned invalid_app_id. Published paths/components matched between specification hosts. See `public-checks.json`. Public AppId is integration metadata, not a user credential. These checks prove only public reachability and unauthenticated enforcement, not per-user authorization or cross-account isolation.
++- Simulator builds passed during implementation; final build/patch evidence is recorded in `PRODUCTION_HANDOFF.md`. A build is not interaction acceptance.
++- Not exercised: live Sonnet query/tool selection, free-form coaching safety, live authenticated login/read/goal/refresh/logout, ElevenLabs sessions, microphone lifecycle, full three-member reset/isolation journeys, real-source recipe journey, chart drag/range UI automation, comprehensive VoiceOver/Dynamic Type/contrast audit, device/App Store Release. Do not mark those accepted from unit tests or one chart disclosure interaction.
++
++## 8. Porting into the collaborator's redesigned app
++
++1. Inspect the destination's navigation, state owner, styling and deployment target first. Preserve its designer-authored layout; do not overwrite an entire screen tree or project file with the portable patch. Use the patch as a reference diff on a separate feature branch.
++2. Port the deterministic engine/query/observation contracts first. Adapt `DemoMember` and baseline ownership to the destination, keeping all three member datasets and explicit provenance. Add query tests before changing semantic behavior.
++3. Embed `DemoInsightCard` within the destination's existing chat message rows. Retain source/limitations, independent units, empty recovery and accessible date/value disclosure. Map theme tokens rather than transplanting navigation.
++4. Add optional persisted insights/invitation fields to the destination message type, preserving old decoding. Connect validated Sonnet tool routing and history serialization. Do not let the model provide points, patient IDs, ranges or clinical narration for cards. Keep exact requested model `anthropic/claude-sonnet-5.5`, no fallback.
++5. Add the walkthrough through the existing menu/chat discovery. Preserve separate live-request versus no-network preview labels. Port local follow-up review with member/revision binding; do not wire a mock confirmation to a real mutation.
++6. Port `RumiAppAPI` as a separate verified-account dependency and map its settings/review views into the destination's Account flow. Never reuse demo IDs or legacy Companion tokens as existing-Rumi authorization. Ensure Keychain service namespaces do not collide unintentionally between products; define app/user ownership for production multi-account support.
++7. Confirm baseURL/public AppId with the owner. Use only an authorized test account; explicitly approve any challenge delivery and goal write. Keep server/provider keys out of the phone and source. Do not deploy old migrations as setup for this API.
++8. Run deterministic, mocked-transport and UI tests in the destination, adapting the stable accessibility identifiers rather than exact English hierarchy assumptions. Then exercise the live checklist below. Do not infer parity from a clean patch application.
++
++The portable patch also includes older browser/voice/Companion work for the baseline fork. Selectively port only needed dependencies. Review `functions/` and the SQL migration as **deferred legacy work**, not mandatory deployment instructions. The linked source repositories remain untouched; the patch does not assert a GitHub push/PR/merge.
++
++## 9. Owner-assisted acceptance next
++
++- Confirm HTTPS baseURL and public appID; identify a verified test user through the existing service. No provider/server keys should be pasted into chat.
++- With consent, verify challenge delivery/status, code expiry/resend behavior, login, records mode and user-bound reads; test two authorized users for isolation and revoked/expired sessions.
++- Review one exact goal, submit once with stable idempotency key, verify committed receipt and returned saved goals. Intentionally exercise uncertain network outcomes without duplicating writes.
++- Exercise each live Sonnet example, missing-data/failure states, a worried number mention, accepting/declining the invitation, stopping/swapping member midrequest, relaunch/reset, and confirm no model-generated numerical narration bypasses the card boundary.
++- Verify chart filters/drag and accessible values on large text/VoiceOver, including empty windows and side-by-side units.
++- Scope and implement new App API ElevenLabs transport only after reviewing its permitted SDK/session options. Keep messaging/call ownership with the deployed backend; no competing provider cutover.
+diff --git a/tools/verify-rumi-app-api.py b/tools/verify-rumi-app-api.py
+new file mode 100644
+--- /dev/null
++++ b/tools/verify-rumi-app-api.py
+@@ -0,0 +1,107 @@
++#!/usr/bin/env python3
++"""Public, read-only contract checks. Never sends login challenges or user writes.
++
++The Swagger's preauthorized AppId is public integration metadata, not a user token.
++Live acceptance still needs an owner-confirmed origin/AppId and a verified test account.
++"""
++import hashlib
++import json
++from pathlib import Path
++import re
++import unittest
++from urllib.error import HTTPError
++from urllib.parse import urlsplit
++from urllib.request import Request, urlopen
++
++ROOT = Path(__file__).resolve().parents[1]
++SWAGGER = "https://rumi-api-amber.vercel.app/"
++SPEC = SWAGGER + "openapi.json"
++SUPABASE_SPEC = "https://egoicdonmuudwvbsockm.supabase.co/functions/v1/rumi-app-api/openapi.json"
++
++
++def get(url, headers=None):
++    request = Request(url, headers={"Accept": "application/json", **(headers or {})})
++    try:
++        with urlopen(request, timeout=30) as response:
++            return response.status, response.read(2_000_000)
++    except HTTPError as error:
++        return error.code, error.read(100_000)
++
++
++class ContractChecks(unittest.TestCase):
++    @classmethod
++    def setUpClass(cls):
++        status, raw = get(SPEC)
++        if status != 200:
++            raise RuntimeError(f"Published Swagger OpenAPI unavailable: HTTP {status}")
++        cls.spec = json.loads(raw)
++        status, page = get(SWAGGER)
++        if status != 200:
++            raise RuntimeError(f"Swagger unavailable: HTTP {status}")
++        match = re.search(r'preauthorizeApiKey\("AppId","([a-f0-9-]+)"\)', page.decode())
++        if not match:
++            raise RuntimeError("Swagger public AppId not found; no credential was guessed")
++        cls.public_app_id = match.group(1)
++        cls.base = cls.spec["servers"][0]["url"].rstrip("/")
++        if urlsplit(cls.base).scheme != "https":
++            raise RuntimeError("Swagger server is not HTTPS; refusing to send requests")
++        cls.observations = {"spec_sha256": hashlib.sha256(raw).hexdigest(), "tested_documented_origin": cls.base, "checks": [], "authenticated_acceptance": "not performed", "mutations_sent": False}
++        folder = ROOT / "integrations/rumi-app-api"
++        folder.mkdir(parents=True, exist_ok=True)
++        (folder / "openapi.json").write_bytes(raw)
++
++    def check_status(self, path, expected, headers=None):
++        status, raw = get(self.base + path, headers)
++        self.observations["checks"].append({"path": path, "expected_status": expected, "actual_status": status})
++        self.assertEqual(status, expected)
++        return json.loads(raw)
++
++    def test_01_health_is_public(self):
++        result = self.check_status("/health", 200)
++        self.assertEqual(result["service"], "rumi-app-api")
++        self.assertEqual(result["status"], "ok")
++
++    def test_02_config_accepts_public_app_id(self):
++        config = self.check_status("/v1/config", 200, {"x-rumi-app-id": self.public_app_id})
++        self.assertIn(config["records_mode"], ["test", "live"])
++
++    def test_03_app_id_does_not_authorize_user_data(self):
++        for path in ["me", "context", "memory", "goals", "records", "conversations"]:
++            with self.subTest(path=path):
++                response = self.check_status("/v1/" + path, 401, {"x-rumi-app-id": self.public_app_id})
++                self.assertIn("code", response["error"])
++
++    def test_04_invalid_app_id_fails(self):
++        response = self.check_status("/v1/me", 401)
++        self.assertEqual(response["error"]["code"], "invalid_app_id")
++
++    def test_05_authentication_and_rotation_contract(self):
++        security = self.spec["components"]["securitySchemes"]
++        self.assertEqual(security["AppId"]["name"], "x-rumi-app-id")
++        self.assertEqual(security["Bearer"]["scheme"], "bearer")
++        self.assertIn("ServerKey", security)
++        self.assertEqual(self.spec["paths"]["/v1/auth/exchange"]["post"]["security"], [{"AppId": [], "ServerKey": []}])
++        self.assertIn("refresh_token", self.spec["components"]["schemas"]["Session"]["required"])
++        self.assertIn("committed", self.spec["components"]["schemas"]["Receipt"]["properties"])
++
++    def test_06_no_assumed_insight_transport(self):
++        self.assertFalse(any("insight" in path.lower() for path in self.spec["paths"]))
++        conversation = self.spec["components"]["schemas"]["Conversation"]["properties"]
++        self.assertIn("sdk_options", conversation)
++        self.assertIn("signedUrl", conversation["sdk_options"]["properties"])
++
++    def test_07_supabase_and_swagger_contracts_match_except_server(self):
++        status, raw = get(SUPABASE_SPEC)
++        self.assertEqual(status, 200)
++        other = json.loads(raw)
++        self.assertEqual(other["paths"], self.spec["paths"])
++        self.assertEqual(other["components"], self.spec["components"])
++        self.observations["supabase_servers"] = other.get("servers")
++
++    @classmethod
++    def tearDownClass(cls):
++        (ROOT / "integrations/rumi-app-api/public-checks.json").write_text(json.dumps(cls.observations, indent=2) + "\n")
++
++
++if __name__ == "__main__":
++    unittest.main(verbosity=2)
 diff --git a/ios-rumi/Rumi/DemoServices.swift b/ios-rumi/Rumi/DemoServices.swift
 new file mode 100644
 --- /dev/null
@@ -3825,7 +5066,7 @@ diff --git a/ios-rumi/Rumi/CompanionService.swift b/ios-rumi/Rumi/CompanionServi
 new file mode 100644
 --- /dev/null
 +++ b/ios-rumi/Rumi/CompanionService.swift
-@@ -0,0 +1,143 @@
+@@ -0,0 +1,147 @@
 +import Foundation
 +import Security
 +import SwiftUI
@@ -3957,6 +5198,10 @@ new file mode 100644
 +                }
 +            }
 +            if let error { Section { Text(error).foregroundStyle(.red) } }
++            Section("Existing backend · New App API") {
++                NavigationLink("Rumi App API · Verified account") { RumiAppAPIView() }
++                Text("Use the published App API contract with its own public app ID and verified user session. Demo mode never calls these routes.").font(.footnote)
++            }
 +            Section {
 +                NavigationLink("Calls & iMessage") { CompanionChannelsView() }
 +                if connection.connected { Button("Disconnect this device", role: .destructive) { showDisconnect = true } }
