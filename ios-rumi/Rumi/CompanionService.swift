@@ -42,6 +42,7 @@ final class CompanionConnection {
         identityVersion = UUID()
     }
     func request<T: Decodable>(_ path: String, body: [String: Any]? = nil, as type: T.Type = T.self) async throws -> T {
+        let identity = identityVersion
         guard let token = Self.token(), let url = URL(string: endpoint + "/companion/" + path), url.scheme == "https" else { throw CompanionError(message: "Connect your Rumi account in Menu → Account to use this feature.") }
         var request = URLRequest(url: url)
         request.httpMethod = body == nil ? "GET" : "POST"
@@ -50,12 +51,22 @@ final class CompanionConnection {
         request.timeoutInterval = path == "chat" ? 150 : 60
         if let body { request.httpBody = try JSONSerialization.data(withJSONObject: body) }
         let (data, response) = try await URLSession.shared.data(for: request)
+        guard identityVersion == identity else { throw CompanionError(message: "Your account changed. Reopen this screen to use the current account.") }
         guard let http = response as? HTTPURLResponse else { throw CompanionError(message: "The Rumi service did not respond.") }
         guard (200..<300).contains(http.statusCode) else {
             let problem = try? JSONDecoder().decode(ServiceProblem.self, from: data)
             throw CompanionError(message: problem?.error ?? "Rumi could not connect (\(http.statusCode)). Please try again.")
         }
         return try JSONDecoder().decode(T.self, from: data)
+    }
+    func voiceRequest(address: String) throws -> URLRequest {
+        guard let token = Self.token(), let url = URL(string: address), let serviceURL = URL(string: endpoint),
+              url.scheme == "wss", url.host == serviceURL.host, url.port == serviceURL.port,
+              url.user == nil, url.password == nil, url.query == nil, url.fragment == nil,
+              url.path.hasPrefix("/companion/voice/socket/") else { throw CompanionError(message: "The voice connection does not belong to your Rumi service.") }
+        var request = URLRequest(url: url)
+        request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        return request
     }
     private struct ServiceProblem: Decodable { let error: String }
 }
@@ -69,6 +80,8 @@ struct CompanionStatus: Decodable {
     let chat: Bool?
     let conversationService: String?
     let historyNotice: String?
+    let sharedBackend: Bool?
+    let sharedContext: Bool?
 }
 struct ServiceOK: Decodable { let ok: Bool }
 struct RemoteConversation: Decodable {
@@ -108,7 +121,10 @@ struct CompanionAccountView: View {
                     if let service = status.conversationService { LabeledContent("Conversation", value: service) }
                     LabeledContent("Voice", value: status.voice ? "Configured" : "Needs setup")
                     LabeledContent("Calls", value: status.calls ? "Configured" : "Needs setup")
-                    LabeledContent("Photon v2 app sync", value: status.imessage ? "Configured" : "Not connected")
+                    LabeledContent(status.sharedBackend == true ? "iMessage owner" : "Photon v2 app sync", value: status.sharedBackend == true ? "Shared backend" : status.imessage ? "Configured" : "Not connected")
+                    if status.sharedBackend == true {
+                        NavigationLink("Saved context & permissions") { SharedContextView() }
+                    }
                     if let notice = status.historyNotice { Text(notice).font(.footnote).foregroundStyle(.secondary) }
                 }
             }

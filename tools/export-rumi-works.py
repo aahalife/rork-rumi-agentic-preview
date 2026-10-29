@@ -17,11 +17,16 @@ FILES = (
     "ios-rumi/Rumi/VoiceModeView.swift",
     "ios-rumi/Rumi/CompanionService.swift",
     "ios-rumi/Rumi/CompanionChannelsView.swift",
+    "ios-rumi/Rumi/SharedContextView.swift",
     "ios-rumi/Rumi/HealthView.swift",
     "ios-rumi/Rumi/HealthTrendsView.swift",
     "ios-rumi/Rumi.xcodeproj/project.pbxproj",
     "functions/rumi-companion.ts",
     "functions/rumi-existing-api.ts",
+    "functions/rumi-pilot.ts",
+    "functions/tsconfig.json",
+    "functions/bun.lock",
+    "integrations/rumi-pilot/202610290001_app_accounts.sql",
     "functions/rumi-ai.ts",
     "functions/package.json",
     "tools/provision-companion-access.py",
@@ -37,6 +42,7 @@ def main():
     # Export only the isolated new routes, not the larger apps' legacy public voice endpoints.
     standalone_index = '''import { handleCompanion, type CompanionEnv } from "./rumi-companion";
 export { RumiCompanionHub } from "./rumi-companion";
+export { RumiPilotVoice } from "./rumi-pilot";
 export { RumiBudget } from "./rumi-ai";
 export default {
   async fetch(request: Request, env: CompanionEnv): Promise<Response> {

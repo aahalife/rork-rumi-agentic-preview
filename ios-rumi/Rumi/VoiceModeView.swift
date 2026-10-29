@@ -29,7 +29,7 @@ final class RumiVoiceSession {
     @ObservationIgnored private var tapped = false
     @ObservationIgnored private var queuedFrames = 0
     @ObservationIgnored private var generation = UUID()
-    struct Ticket: Decodable { let signedURL: String; let userID: String }
+    struct Ticket: Decodable { let signedURL: String; let userID: String; let proxied: Bool? }
     func start() {
         stop(); state = .connecting; error = nil; caption = ""; muted = false
         let token = generation
@@ -40,8 +40,14 @@ final class RumiVoiceSession {
             do {
                 let ticket: Ticket = try await CompanionConnection.shared.request("voice/session", body: [:])
                 guard !Task.isCancelled, generation == token else { return }
-                guard let url = URL(string: ticket.signedURL), url.scheme == "wss", let host = url.host, host == "api.elevenlabs.io" || host.hasSuffix(".elevenlabs.io") else { throw CompanionError(message: "The voice service returned an invalid session address.") }
-                let webSocket = URLSession.shared.webSocketTask(with: url); socket = webSocket; webSocket.resume()
+                let webSocket: URLSessionWebSocketTask
+                if ticket.proxied == true {
+                    webSocket = URLSession.shared.webSocketTask(with: try CompanionConnection.shared.voiceRequest(address: ticket.signedURL))
+                } else {
+                    guard let url = URL(string: ticket.signedURL), url.scheme == "wss", let host = url.host, host == "api.elevenlabs.io" || host.hasSuffix(".elevenlabs.io") else { throw CompanionError(message: "The voice service returned an invalid session address.") }
+                    webSocket = URLSession.shared.webSocketTask(with: url)
+                }
+                socket = webSocket; webSocket.resume()
                 try await send(["type": "conversation_initiation_client_data", "user_id": ticket.userID])
                 receiver = Task {
                     do {
@@ -197,6 +203,7 @@ struct VoiceModeView: View {
         }
         .task { voice.start() }
         .onDisappear { voice.stop() }
+        .onChange(of: CompanionConnection.shared.identityVersion) { _, _ in voice.stop(); dismiss() }
         .onChange(of: scenePhase) { _, phase in if phase == .background { voice.stop() } }
         .onReceive(NotificationCenter.default.publisher(for: AVAudioSession.interruptionNotification)) { _ in voice.stop() }
         .sensoryFeedback(.impact(weight: .light), trigger: voice.state)

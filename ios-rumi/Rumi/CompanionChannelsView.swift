@@ -35,6 +35,7 @@ struct CompanionChannelsView: View {
     struct Calls: Decodable { let calls: [CompanionCall] }
     var body: some View {
         Form {
+            if serviceStatus?.sharedBackend != true {
             Section {
                 TextField("US number, e.g. +1 415 555 0123", text: $number).keyboardType(.phonePad).textContentType(.telephoneNumber)
                 Toggle("Choose a time", isOn: $schedule)
@@ -58,7 +59,14 @@ struct CompanionChannelsView: View {
                     }
                 }
             }
-            if serviceStatus?.conversationService == "Existing Rumi API" {
+            }
+            if serviceStatus?.sharedBackend == true {
+                Section("Shared Rumi conversation") {
+                    Text(serviceStatus?.historyNotice ?? "Your existing Rumi backend owns messaging and calls.").font(.footnote)
+                    NavigationLink("Saved context & call permissions") { SharedContextView() }
+                    Text("Continue in your existing Rumi iMessage thread. App-side relinking and one-off calls are disabled to avoid a second messaging or call owner.").font(.footnote).foregroundStyle(.secondary)
+                }
+            } else if serviceStatus?.conversationService == "Existing Rumi API" {
                 Section("Existing Rumi conversation") {
                     Text(serviceStatus?.historyNotice ?? "Your existing Rumi service owns messaging.").font(.footnote)
                     Text("Calls can only ring your verified Rumi number. App unlinking does not disconnect your existing messaging service.").font(.footnote).foregroundStyle(.secondary)

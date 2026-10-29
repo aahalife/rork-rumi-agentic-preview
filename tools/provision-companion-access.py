@@ -9,6 +9,7 @@ import re
 import secrets
 import time
 from urllib.parse import urlsplit
+from uuid import UUID
 
 
 def secure_write(path: Path, value: str) -> None:
@@ -22,7 +23,20 @@ def main() -> None:
     parser.add_argument("--subject", required=True, help="Opaque account ID, not a name, email or phone number")
     parser.add_argument("--directory", type=Path, required=True, help="Private directory OUTSIDE the repository")
     parser.add_argument("--existing-chat-link-file", type=Path, help="Private file OUTSIDE the repository containing this verified account owner's existing signed Rumi chat URL")
+    parser.add_argument("--pilot-user-id", help="Existing shared-backend Rumi UUID; use only after independently verifying ownership")
+    parser.add_argument("--ownership-reference", help="Private verification receipt reference for the app-to-Rumi association")
     args = parser.parse_args()
+    if args.pilot_user_id and args.existing_chat_link_file:
+        parser.error("Choose the current shared backend OR the legacy signed-link adapter, not both.")
+    if bool(args.pilot_user_id) != bool(args.ownership_reference):
+        parser.error("A shared-backend mapping requires both the existing user UUID and an ownership verification reference.")
+    if args.pilot_user_id:
+        try:
+            args.pilot_user_id = str(UUID(args.pilot_user_id))
+        except ValueError:
+            parser.error("Use the existing Rumi user's UUID, not a phone number, email or session ID.")
+        if not 1 <= len(args.ownership_reference) <= 200 or any(ord(c) < 32 for c in args.ownership_reference):
+            parser.error("Use a 1–200 character verification reference without control characters.")
     if not re.fullmatch(r"[A-Za-z0-9_-]{1,80}", args.subject):
         parser.error("Subject must be 1–80 letters, numbers, underscores or hyphens.")
     repository = Path(__file__).resolve().parents[1]
@@ -36,6 +50,9 @@ def main() -> None:
     registry_file = destination / f"{args.subject}.server-registry.json"
     if account_file.exists() or registry_file.exists():
         parser.error("Refusing to overwrite an existing credential file.")
+    pilot_file = destination / f"{args.subject}.pilot-mapping.sql"
+    if args.pilot_user_id and pilot_file.exists():
+        parser.error("Refusing to overwrite an existing shared-backend mapping.")
     api_file = destination / f"{args.subject}.existing-api-secrets.json"
     api_config = None
     if args.existing_chat_link_file:
@@ -60,10 +77,23 @@ def main() -> None:
     secure_write(registry_file, json.dumps(mapping) + "\n")
     if api_config:
         secure_write(api_file, json.dumps(api_config) + "\n")
+    if args.pilot_user_id:
+        subject_hash = hashlib.sha256(f"rumi-iphone:v1:{args.subject}".encode()).hexdigest()
+        reference = args.ownership_reference.replace("'", "''")
+        secure_write(pilot_file, (
+            "-- Apply privately after verifying ownership and installing the app-account migration.\n"
+            "-- No upsert: duplicate accounts/phone changes require explicit reconciliation.\n"
+            "insert into public.rumi_app_accounts(subject_hash,user_id,verification_reference) values ("
+            f"'{subject_hash}','{args.pilot_user_id}','{reference}');\n"
+        ))
     print(f"Created private credential files in {destination}")
     print("Merge the server registry into RUMI_ACCESS_TOKENS using server secret settings.")
     print("Use only the account token in the iPhone Account screen; never paste either file into chat.")
     print("To revoke access, remove its hash from the server registry. Do not reuse a subject for another person.")
+    if args.pilot_user_id:
+        print("Apply the private pilot-mapping.sql file to the existing shared-backend database only after ownership verification.")
+        print("This script does not verify ownership, create a Rumi profile, deploy migrations, or enable providers.")
+        print("Revoke a shared mapping by setting revoked_at; this closes existing app tool sessions too.")
     if api_config:
         print("Install the existing API settings through server secret management; merge account mappings, do not replace other accounts.")
         print("Provision only after verifying that the Rumi chat link belongs to this account owner. Links expire after 24 hours; renew privately.")

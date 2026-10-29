@@ -1,8 +1,10 @@
 import { DurableObject } from "cloudflare:workers";
-import { RUMI_MODEL, urgentReply, type AIEnv } from "./rumi-ai";
+import { RUMI_MODEL, urgentReply } from "./rumi-ai";
 import { existingAccountNumber, existingAccountReady, existingCallData, existingChat, usesExistingAPI, type ExistingAPIEnv } from "./rumi-existing-api";
+import { pilotChat, pilotContext, pilotMemory, pilotReady, usesPilot, type PilotEnv } from "./rumi-pilot";
 
-export interface CompanionEnv extends AIEnv, ExistingAPIEnv {
+export interface CompanionEnv extends ExistingAPIEnv, PilotEnv {
+  ANTHROPIC_API_KEY?: string;
   /** JSON map of SHA-256(access token) -> opaque user ID. Never ship this to clients. */
   RUMI_ACCESS_TOKENS?: string;
   RUMI_AGENT_MODEL?: string;
@@ -108,16 +110,38 @@ export async function handleCompanion(request: Request, env: CompanionEnv): Prom
   const path = new URL(request.url).pathname.replace(/^\/companion/, "");
   try {
     if (path === "/photon/webhook" && request.method === "POST") {
+      if (usesPilot(env)) return fail("The shared Rumi backend owns messaging. Preserve its configured intake transport; Photon v2 inbound compatibility is not established.", 409);
       const event = await verifyPhoton(request, env);
       if (!event) return fail("Invalid signature.", 401);
       return hub(env, "/photon", event);
     }
     const subject = await subjectFor(request, env);
     if (!subject) return fail("Connect your Rumi account in Account settings.", 401);
-    const limits = request.method === "GET" ? "day=12000&minute=120" : "day=500&minute=30";
-    const budget = await env.DO.fetch(new Request(`https://internal/reserve?${limits}`, { method: "POST", headers: { "X-Rork-DO-Class": "RumiBudget", "X-Rork-DO-Id": `companion:${request.method === "GET" ? "read" : "write"}:${subject}` } }));
+    const isVoiceUpgrade = path.startsWith("/voice/socket/");
+    const limits = request.method === "GET" && !isVoiceUpgrade ? "day=12000&minute=120" : "day=500&minute=30";
+    const budget = await env.DO.fetch(new Request(`https://internal/reserve?${limits}`, { method: "POST", headers: { "X-Rork-DO-Class": "RumiBudget", "X-Rork-DO-Id": `companion:${request.method === "GET" && !isVoiceUpgrade ? "read" : "write"}:${subject}` } }));
     if (!budget.ok) return budget;
+    if (usesPilot(env) && usesExistingAPI(env)) return fail("Choose one Rumi conversation backend. Remove the older RUMI_API_ORIGIN before enabling the shared pilot backend.", 503);
+    if (usesPilot(env) && path.startsWith("/voice/socket/") && request.method === "GET") {
+      const id = path.slice("/voice/socket/".length);
+      if (!/^[a-f0-9-]{36}$/.test(id) || request.headers.get("Upgrade")?.toLowerCase() !== "websocket") return fail("Invalid voice session.");
+      const voiceBudget = await spend(env, "companion:global:voice", 1000, 40);
+      if (!voiceBudget.ok) return voiceBudget;
+      const upgrade = new Request(request.url, request);
+      upgrade.headers.set("X-Rork-DO-Class", "RumiPilotVoice");
+      upgrade.headers.set("X-Rork-DO-Id", `voice:${subject}:${id}`);
+      upgrade.headers.set("X-Rumi-Subject", subject);
+      return env.DO.fetch(upgrade);
+    }
     if (path === "/status" && request.method === "GET") {
+      if (usesPilot(env)) {
+        const ready = await pilotReady(env, subject);
+        return j({ model: env.RUMI_AGENT_MODEL || RUMI_MODEL, browser: !!env.ANTHROPIC_API_KEY,
+          chat: ready && !!(env.RUMI_ELEVENLABS_API_KEY && env.RUMI_ELEVENLABS_AGENT_ID),
+          voice: ready && !!(env.RUMI_ELEVENLABS_API_KEY && env.RUMI_ELEVENLABS_AGENT_ID), calls: false, imessage: false,
+          sharedContext: ready, sharedBackend: true, conversationService: "Rumi shared backend",
+          historyNotice: "Chat and voice use the existing ElevenLabs agent and verified Rumi profile. Saved memory is shared with linked iMessage and phone; earlier transcripts are not imported. The existing backend owns messaging and recurring calls. One-off app calls and app-side iMessage relinking are disabled in this mode." });
+      }
       const existing = usesExistingAPI(env), ready = existing && existingAccountReady(env, subject);
       return j({ model: env.RUMI_AGENT_MODEL || RUMI_MODEL, browser: !!env.ANTHROPIC_API_KEY,
         chat: existing ? ready : !!env.ANTHROPIC_API_KEY, conversationService: existing ? "Existing Rumi API" : "Rumi companion",
@@ -126,12 +150,14 @@ export async function handleCompanion(request: Request, env: CompanionEnv): Prom
         calls: (!existing || (ready && !!env.RUMI_API_INIT_SECRET)) && !!(env.RUMI_ELEVENLABS_API_KEY && env.RUMI_ELEVENLABS_AGENT_ID && env.RUMI_ELEVENLABS_PHONE_NUMBER_ID),
         imessage: !existing && !!(env.PHOTON_API_KEY && env.PHOTON_PROJECT_ID && env.PHOTON_AGENT_USER_ID && env.PHOTON_WEBHOOK_SECRET && env.PHOTON_LINE_ADDRESS) });
     }
+    if (path === "/context" && request.method === "GET" && usesPilot(env)) return j(await pilotContext(env, subject));
     if (path === "/messages" && request.method === "GET") return hub(env, "/messages", { subject });
     if (path === "/calls" && request.method === "GET") return hub(env, "/calls", { subject });
     if (request.method !== "POST") return fail("Not found.", 404);
     const global = await spend(env, "companion:global:write", 4000, 100);
     if (!global.ok) return global;
     const input = await body(request);
+    if (path === "/memory" && usesPilot(env)) return hub(env, "/memory", { ...input, subject });
     if (path === "/chat") {
       if (typeof input.text !== "string" || !input.text.trim() || input.text.length > 6000 || typeof input.id !== "string" || !/^[A-Za-z0-9_-]{20,80}$/.test(input.id)) return fail("A message and request ID are required.");
       return hub(env, "/chat", { subject, text: input.text, id: input.id });
@@ -150,6 +176,12 @@ export async function handleCompanion(request: Request, env: CompanionEnv): Prom
       return j(action);
     }
     if (path === "/voice/session") {
+      if (usesPilot(env)) {
+        if (!await pilotReady(env, subject)) return fail("Link this account to its verified existing Rumi profile first.", 403);
+        if (!env.RUMI_ELEVENLABS_API_KEY || !env.RUMI_ELEVENLABS_AGENT_ID) return fail("Connect the existing ElevenLabs agent first.", 503);
+        const socket = new URL(request.url); socket.protocol = "wss:"; socket.pathname = `/companion/voice/socket/${crypto.randomUUID()}`; socket.search = "";
+        return j({ signedURL: socket.toString(), userID: "", proxied: true });
+      }
       if (usesExistingAPI(env)) return fail("Use your existing Rumi phone agent for shared-memory voice. Secure microphone-session authorization is not available in the supplied API yet.", 503);
       if (!env.RUMI_ELEVENLABS_API_KEY || !env.RUMI_ELEVENLABS_AGENT_ID) return fail("Voice is not connected yet.", 503);
       const upstream = await fetch(`https://api.elevenlabs.io/v1/convai/conversation/get-signed-url?agent_id=${encodeURIComponent(env.RUMI_ELEVENLABS_AGENT_ID)}`, { headers: { "xi-api-key": env.RUMI_ELEVENLABS_API_KEY }, signal: AbortSignal.timeout(15000) });
@@ -157,6 +189,7 @@ export async function handleCompanion(request: Request, env: CompanionEnv): Prom
       const data = await upstream.json() as { signed_url?: string };
       return j({ signedURL: data.signed_url, userID: subject });
     }
+    if (usesPilot(env) && ["/calls/create", "/imessage/link", "/imessage/unlink"].includes(path)) return fail("Your shared Rumi backend owns calls and messaging. Use Saved context to pause its recurring calls. App-side linking and one-off calls are not enabled in this mode.", 409);
     if (path === "/calls/create" || path === "/calls/cancel" || path === "/imessage/link" || path === "/imessage/unlink") return hub(env, path, { ...input, subject });
     return fail("Not found.", 404);
   } catch (error) {
@@ -166,7 +199,7 @@ export async function handleCompanion(request: Request, env: CompanionEnv): Prom
 
 /** Private durable state. Only this Worker's authenticated router can forward requests here. */
 export class RumiCompanionHub extends DurableObject<CompanionEnv> {
-  private messageKey(subject: string): string { return `${usesExistingAPI(this.env) ? "api-messages" : "messages"}:${subject}`; }
+  private messageKey(subject: string): string { return `${usesPilot(this.env) ? "pilot-messages" : usesExistingAPI(this.env) ? "api-messages" : "messages"}:${subject}`; }
   private async messages(subject: string): Promise<Message[]> { return await this.ctx.storage.get<Message[]>(this.messageKey(subject)) || []; }
   private async add(subject: string, role: Message["role"], text: string, source: Message["source"], id = crypto.randomUUID()): Promise<Message[]> {
     const history = await this.messages(subject);
@@ -191,6 +224,23 @@ export class RumiCompanionHub extends DurableObject<CompanionEnv> {
     const input = await request.json() as Record<string, any>;
     const subject = input.subject as string;
     if (path === "/messages") return j({ messages: await this.messages(subject) });
+    if (path === "/memory" && usesPilot(this.env)) {
+      if (typeof input.id !== "string" || !/^[A-Za-z0-9_-]{20,80}$/.test(input.id)) return fail("A stable operation ID is required.");
+      if (!await this.reserve(subject)) return fail("Another change is in progress. Wait before trying again.", 409);
+      try {
+        const key = `pilot-memory:${subject}:${input.id}`;
+        const fingerprint = await digest(JSON.stringify({ operation: input.operation, permission: input.permission, text: input.text, confirmed: input.confirmed }));
+        const prior = await this.ctx.storage.get<{ fingerprint: string; result?: unknown }>(key);
+        if (prior) {
+          if (prior.fingerprint !== fingerprint) return fail("This operation ID belongs to a different change.", 409);
+          return prior.result ? j(prior.result) : fail("This change may already have reached Rumi. Refresh saved context before making a new request.", 409);
+        }
+        await this.ctx.storage.put(key, { fingerprint });
+        const result = await pilotMemory(this.env, subject, input);
+        await this.ctx.storage.put(key, { fingerprint, result }); return j(result);
+      } catch (error) { return fail(error instanceof Error ? error.message : "The shared memory change was not confirmed.", 503); }
+      finally { await this.ctx.storage.delete(`turn:${subject}`); }
+    }
     if (path === "/chat") {
       if (!await this.reserve(subject)) return fail("Rumi is finishing another reply. Try again shortly.", 409);
       try {
@@ -199,6 +249,17 @@ export class RumiCompanionHub extends DurableObject<CompanionEnv> {
         const edited = index >= 0 && old[index].text !== input.text;
         const replied = old.find(m => m.id === `${input.id}-reply`);
         if (!edited && replied) return j({ text: replied.text });
+        if (usesPilot(this.env)) {
+          if (edited) return fail("Saved Rumi memory cannot be rewound. Send a correction as a new message.", 409);
+          const attempt = `pilot-attempt:${subject}:${input.id}`;
+          const prior = await this.ctx.storage.get<{ hash: string }>(attempt);
+          if (prior) return fail("This message was already submitted to the shared agent. Check saved context before sending again; an uncertain request is never replayed.", 409);
+          await this.ctx.storage.put(attempt, { hash: await digest(input.text), at: Date.now() });
+          await this.add(subject, "user", input.text, "app", input.id);
+          const text = await pilotChat(this.env, subject, input.text, old);
+          await this.add(subject, "assistant", text, "app", `${input.id}-reply`);
+          return j({ text });
+        }
         if (usesExistingAPI(this.env)) {
           if (edited) return fail("The existing Rumi memory cannot be rewound. Send your correction as a new message.", 409);
           const attempt = `api-attempt:${subject}:${input.id}`;
@@ -218,7 +279,7 @@ export class RumiCompanionHub extends DurableObject<CompanionEnv> {
         const text = await chatReply(this.env, history);
         await this.add(subject, "assistant", text, "app", `${input.id}-reply`);
         return j({ text });
-      } catch (error) { return fail(usesExistingAPI(this.env) && error instanceof Error ? error.message : "Rumi’s model could not reply. Check model access and try again.", 503); }
+      } catch (error) { return fail((usesPilot(this.env) || usesExistingAPI(this.env)) && error instanceof Error ? error.message : "Rumi’s model could not reply. Check model access and try again.", 503); }
       finally { await this.ctx.storage.delete(`turn:${subject}`); }
     }
     if (path === "/imessage/link") {
@@ -263,7 +324,7 @@ export class RumiCompanionHub extends DurableObject<CompanionEnv> {
   }
   private async photon(event: Record<string, any>): Promise<Response> {
     // One inbound owner only. Do not answer from a second independent memory.
-    if (usesExistingAPI(this.env)) return j({ ignored: true });
+    if (usesPilot(this.env) || usesExistingAPI(this.env)) return j({ ignored: true });
     if (event.apiVersion !== "2026-07-01" || event.type !== "message.received" || event.source !== "imessage.photon" || event.data?.projectId !== this.env.PHOTON_PROJECT_ID) return j({ ignored: true });
     const message = event.data.object;
     if (message?.platform !== "imessage" || message.status !== "received" || message.sentBy?.kind === "agent" || message.sentBy?.id === this.env.PHOTON_AGENT_USER_ID || message.projectId !== this.env.PHOTON_PROJECT_ID || !message.space?.participantIds?.includes(this.env.PHOTON_AGENT_USER_ID) || message.space?.kind !== "direct" || message.space?.participantIds?.length !== 2 || typeof message.space?.id !== "string" || typeof message.sentBy?.id !== "string") return j({ ignored: true });
@@ -318,15 +379,15 @@ export class RumiCompanionHub extends DurableObject<CompanionEnv> {
   private async schedule(): Promise<void> {
     const calls = await this.ctx.storage.list<Call>({ prefix: "call:" });
     const dates = [...calls.values()].filter(c => c.status === "scheduled").map(c => c.at);
-    if (dates.length) await this.ctx.storage.setAlarm(Math.max(Date.now() + 1000, Math.min(...dates)));
-    else await this.ctx.storage.deleteAlarm();
+    if (dates.length) await this.env.DO.setAlarm("RumiCompanionHub", "companion-v1", Math.max(Date.now() + 1000, Math.min(...dates)));
+    else await this.env.DO.deleteAlarm("RumiCompanionHub", "companion-v1");
   }
-  async alarm(): Promise<void> {
+  async onAlarm(): Promise<void> {
     const calls = await this.ctx.storage.list<Call>({ prefix: "call:" });
     for (const [key, call] of calls) {
       if (call.status !== "scheduled" || call.at > Date.now()) continue;
       if (!activeSubject(this.env, key.split(":")[1])) { call.status = "cancelled"; await this.ctx.storage.put(key, call); continue; }
-      if ((call.service || "companion") !== (usesExistingAPI(this.env) ? "existing-api" : "companion")) { call.status = "cancelled"; await this.ctx.storage.put(key, call); continue; }
+      if (usesPilot(this.env) || (call.service || "companion") !== (usesExistingAPI(this.env) ? "existing-api" : "companion")) { call.status = "cancelled"; await this.ctx.storage.put(key, call); continue; }
       if (Date.now() - call.at > 10 * 60000) { call.status = "missed"; await this.ctx.storage.put(key, call); continue; }
       // Persist BEFORE network I/O. An ambiguous failure is never auto-redialed.
       call.status = "connecting"; await this.ctx.storage.put(key, call);

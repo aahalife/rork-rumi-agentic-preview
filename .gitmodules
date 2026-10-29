@@ -2,3 +2,7 @@
 	path = linked/rumi-research-preview
 	url = https://github.com/aahalife/rork-rumi-research-preview.git
 	branch = main
+[submodule "linked/rumi"]
+	path = linked/rumi
+	url = https://github.com/aahalife/Rumi.git
+	branch = main

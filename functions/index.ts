@@ -1,6 +1,7 @@
 import { handleAI, modelStatus } from "./rumi-ai";
 import { handleCompanion, type CompanionEnv } from "./rumi-companion";
 export { RumiCompanionHub } from "./rumi-companion";
+export { RumiPilotVoice } from "./rumi-pilot";
 export { RumiBudget } from "./rumi-ai";
 
 interface Env extends CompanionEnv {
@@ -97,7 +98,10 @@ export default {
 
     if (request.method === "OPTIONS") return new Response(null, { status: 204, headers: corsHeaders });
 
-    if (url.pathname.startsWith("/companion/")) return cors(await handleCompanion(request, env));
+    if (url.pathname.startsWith("/companion/")) {
+      const response = await handleCompanion(request, env);
+      return response.status === 101 ? response : cors(response);
+    }
 
     if (url.pathname === "/ai/status" && request.method === "GET") return cors(await modelStatus(env));
     if (url.pathname === "/ai/chat" && request.method === "POST") return cors(await handleAI(request, env));
