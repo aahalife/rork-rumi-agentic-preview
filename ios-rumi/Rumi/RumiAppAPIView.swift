@@ -39,7 +39,7 @@ struct RumiAppAPIView: View {
                     LabeledContent("API version", value: configuration.api_version ?? "Not returned")
                     LabeledContent("Records mode", value: configuration.records_mode ?? "Not returned")
                 }
-                Text("Awaiting the owner-confirmed base URL and app ID. Do not paste an ElevenLabs, Supabase, Photon or server key here. Changing these settings disconnects this API session.").font(.footnote)
+                Text("The default base URL and public app ID are owner-confirmed. Saved custom settings are preserved. Do not paste an ElevenLabs, Supabase, Photon or server key here. Changing these settings disconnects this API session.").font(.footnote)
             }
             if !api.authenticated {
                 Section("Verify your existing Rumi account") {

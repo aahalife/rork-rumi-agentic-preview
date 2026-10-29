@@ -10,6 +10,11 @@ private final class RumiAPINoRedirectDelegate: NSObject, URLSessionTaskDelegate,
 struct RumiAPISettings: Codable, Equatable {
     let baseURL: String
     let appID: String
+    // Owner-confirmed public integration metadata; never a user credential.
+    static let ownerConfirmed = RumiAPISettings(
+        baseURL: "https://egoicdonmuudwvbsockm.supabase.co/functions/v1/rumi-app-api",
+        appID: "50594005-ee06-4087-abdf-733596f001e6"
+    )
     func validatedURL() throws -> URL {
         guard let url = URL(string: baseURL), url.scheme == "https", url.host != nil,
               url.user == nil, url.password == nil, url.query == nil, url.fragment == nil,
@@ -101,6 +106,7 @@ final class RumiAppAPI {
         let configuration = URLSessionConfiguration.ephemeral
         configuration.urlCache = nil; configuration.httpCookieStorage = nil; configuration.httpShouldSetCookies = false
         self.transport = transport ?? URLSession(configuration: configuration, delegate: RumiAPINoRedirectDelegate(), delegateQueue: nil); self.persist = persist
+        if persist { settings = .ownerConfirmed }
         if persist, let data = UserDefaults.standard.data(forKey: settingsKey), let value = try? JSONDecoder().decode(RumiAPISettings.self, from: data), (try? value.validatedURL()) != nil {
             settings = value
             var item: CFTypeRef?

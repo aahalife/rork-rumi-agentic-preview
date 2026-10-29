@@ -1047,7 +1047,7 @@ diff --git a/ios-rumi/Rumi/RumiAppAPI.swift b/ios-rumi/Rumi/RumiAppAPI.swift
 new file mode 100644
 --- /dev/null
 +++ b/ios-rumi/Rumi/RumiAppAPI.swift
-@@ -0,0 +1,222 @@
+@@ -0,0 +1,228 @@
 +import Foundation
 +import Security
 +import SwiftUI
@@ -1060,6 +1060,11 @@ new file mode 100644
 +struct RumiAPISettings: Codable, Equatable {
 +    let baseURL: String
 +    let appID: String
++    // Owner-confirmed public integration metadata; never a user credential.
++    static let ownerConfirmed = RumiAPISettings(
++        baseURL: "https://egoicdonmuudwvbsockm.supabase.co/functions/v1/rumi-app-api",
++        appID: "50594005-ee06-4087-abdf-733596f001e6"
++    )
 +    func validatedURL() throws -> URL {
 +        guard let url = URL(string: baseURL), url.scheme == "https", url.host != nil,
 +              url.user == nil, url.password == nil, url.query == nil, url.fragment == nil,
@@ -1151,6 +1156,7 @@ new file mode 100644
 +        let configuration = URLSessionConfiguration.ephemeral
 +        configuration.urlCache = nil; configuration.httpCookieStorage = nil; configuration.httpShouldSetCookies = false
 +        self.transport = transport ?? URLSession(configuration: configuration, delegate: RumiAPINoRedirectDelegate(), delegateQueue: nil); self.persist = persist
++        if persist { settings = .ownerConfirmed }
 +        if persist, let data = UserDefaults.standard.data(forKey: settingsKey), let value = try? JSONDecoder().decode(RumiAPISettings.self, from: data), (try? value.validatedURL()) != nil {
 +            settings = value
 +            var item: CFTypeRef?
@@ -1316,7 +1322,7 @@ new file mode 100644
 +                    LabeledContent("API version", value: configuration.api_version ?? "Not returned")
 +                    LabeledContent("Records mode", value: configuration.records_mode ?? "Not returned")
 +                }
-+                Text("Awaiting the owner-confirmed base URL and app ID. Do not paste an ElevenLabs, Supabase, Photon or server key here. Changing these settings disconnects this API session.").font(.footnote)
++                Text("The default base URL and public app ID are owner-confirmed. Saved custom settings are preserved. Do not paste an ElevenLabs, Supabase, Photon or server key here. Changing these settings disconnects this API session.").font(.footnote)
 +            }
 +            if !api.authenticated {
 +                Section("Verify your existing Rumi account") {
@@ -1762,7 +1768,7 @@ new file mode 100644
 +- Snapshotted specification: https://rumi-api-amber.vercel.app/openapi.json
 +- Alternate specification: https://egoicdonmuudwvbsockm.supabase.co/functions/v1/rumi-app-api/openapi.json
 +- `openapi.json` in this directory is the published Swagger variant. SHA-256: `05393d3a2d03dee6bf3812edafb435abf235cde07cb95b9f9a1b820cf5096dea`.
-+- Important discrepancy: Swagger advertises HTTPS `https://egoicdonmuudwvbsockm.supabase.co/functions/v1/rumi-app-api`; the Supabase-hosted spec advertises HTTP and omits `/functions/v1`. Their paths/components matched in the public checks. Never adopt the HTTP URL. Owner confirmation is required before app activation; a documentation origin is not automatically an API base URL.
++- Important discrepancy: Swagger advertises HTTPS `https://egoicdonmuudwvbsockm.supabase.co/functions/v1/rumi-app-api`; the Supabase-hosted spec advertises HTTP and omits `/functions/v1`. Their paths/components matched in the public checks. Never adopt the HTTP URL. The owner has now confirmed the full HTTPS URL above and public AppId `50594005-ee06-4087-abdf-733596f001e6`. They are bundled as defaults when no valid saved settings exist; saved custom settings/sessions are not overwritten. No network request or login is triggered by initialization. A documentation origin is not automatically an API base URL.
 +- Requested source tree: https://github.com/aahalife/rumi/tree/main/backend/app-api. Its new contents were unavailable to this workspace; raw README lookup returned 404. The local `linked/rumi` snapshot remains `da7fdc4dca5f1913a35bd17deedff12824f0fc1d`, not a verified copy of that new API source. Do not infer its internals from the contract.
 +- Existing portable destination: https://github.com/aahalife/rork-rumi-research-preview at unchanged baseline `2a6a5e0`. This is distinct from the production backend repository.
 +
@@ -1858,14 +1864,14 @@ new file mode 100644
 +4. Add optional persisted insights/invitation fields to the destination message type, preserving old decoding. Connect validated Sonnet tool routing and history serialization. Do not let the model provide points, patient IDs, ranges or clinical narration for cards. Keep exact requested model `anthropic/claude-sonnet-5.5`, no fallback.
 +5. Add the walkthrough through the existing menu/chat discovery. Preserve separate live-request versus no-network preview labels. Port local follow-up review with member/revision binding; do not wire a mock confirmation to a real mutation.
 +6. Port `RumiAppAPI` as a separate verified-account dependency and map its settings/review views into the destination's Account flow. Never reuse demo IDs or legacy Companion tokens as existing-Rumi authorization. Ensure Keychain service namespaces do not collide unintentionally between products; define app/user ownership for production multi-account support.
-+7. Confirm baseURL/public AppId with the owner. Use only an authorized test account; explicitly approve any challenge delivery and goal write. Keep server/provider keys out of the phone and source. Do not deploy old migrations as setup for this API.
++7. Use the owner-confirmed defaults above for this deployment; reconfirm settings for any different deployment. Use only an authorized test account; explicitly approve any challenge delivery and goal write. Keep server/provider keys out of the phone and source. Do not deploy old migrations as setup for this API.
 +8. Run deterministic, mocked-transport and UI tests in the destination, adapting the stable accessibility identifiers rather than exact English hierarchy assumptions. Then exercise the live checklist below. Do not infer parity from a clean patch application.
 +
 +The portable patch also includes older browser/voice/Companion work for the baseline fork. Selectively port only needed dependencies. Review `functions/` and the SQL migration as **deferred legacy work**, not mandatory deployment instructions. The linked source repositories remain untouched; the patch does not assert a GitHub push/PR/merge.
 +
 +## 9. Owner-assisted acceptance next
 +
-+- Confirm HTTPS baseURL and public appID; identify a verified test user through the existing service. No provider/server keys should be pasted into chat.
++- HTTPS baseURL and public appID are now owner-confirmed and configured as app defaults. Next, identify a verified test user through the existing service. No provider/server keys should be pasted into chat.
 +- With consent, verify challenge delivery/status, code expiry/resend behavior, login, records mode and user-bound reads; test two authorized users for isolation and revoked/expired sessions.
 +- Review one exact goal, submit once with stable idempotency key, verify committed receipt and returned saved goals. Intentionally exercise uncertain network outcomes without duplicating writes.
 +- Exercise each live Sonnet example, missing-data/failure states, a worried number mention, accepting/declining the invitation, stopping/swapping member midrequest, relaunch/reset, and confirm no model-generated numerical narration bypasses the card boundary.
