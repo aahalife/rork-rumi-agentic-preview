@@ -1945,32 +1945,60 @@ diff --git a/tools/prepare-rumi-demo-prompt.py b/tools/prepare-rumi-demo-prompt.
 new file mode 100644
 --- /dev/null
 +++ b/tools/prepare-rumi-demo-prompt.py
-@@ -0,0 +1,25 @@
-+"""Download the supplied demo prompt and decode the text-only RTF export.
-+No provider credentials or clinical service are accessed.
+@@ -0,0 +1,53 @@
++"""Reproduce the bundled prompt from the latest user-supplied Word document.
++Only the public attachment is downloaded; no provider or clinical service is used.
 +"""
++from io import BytesIO
 +from pathlib import Path
-+import re
++import hashlib
 +import urllib.request
++import xml.etree.ElementTree as ET
++import zipfile
 +
-+url = 'https://r2-pub.rork.com/attachments/7pbqhykso9l7icjsyoswc.rtf'
-+raw = urllib.request.urlopen(url).read().decode('utf-8')
-+# The supplied Cocoa RTF uses uc0 and Unicode code points for line breaks.
-+start = raw.index('RUMI: CHARACTER')
-+text = raw[start:]
-+text = re.sub(r"\\'([0-9a-fA-F]{2})", lambda m: bytes.fromhex(m[1]).decode('cp1252'), text)
-+text = re.sub(r'\\u(-?\d+) ?', lambda m: chr(int(m[1]) % 65536), text)
-+text = re.sub(r'\\(?:par|line)\b ?', '\n', text)
-+text = text.replace('\\{', '\x01').replace('\\}', '\x02')
-+text = re.sub(r'\\[a-zA-Z]+-?\d* ?', '', text)
-+text = text.replace('{', '').replace('}', '').replace('\x01', '{').replace('\x02', '}')
-+text = text.replace('\u2028', '\n').strip().rstrip('\\').rstrip()
-+assert '### 17. Openings and endings' in text
-+assert '{{capabilities}}' in text
-+out = Path(__file__).resolve().parents[1] / 'ios-rumi/Rumi/DemoAgentPrompt.txt'
-+out.write_text(text + '\n')
-+print(f'Prepared {len(text)} characters in {out.name}')
-+print(text[-7500:])
++URL = 'https://r2-pub.rork.com/attachments/cu9nlqe956s802p84jfm7.docx'
++W = '{http://schemas.openxmlformats.org/wordprocessingml/2006/main}'
++
++
++def extract(raw: bytes) -> str:
++    with zipfile.ZipFile(BytesIO(raw)) as archive:
++        document = ET.fromstring(archive.read('word/document.xml'))
++    paragraphs = []
++    for paragraph in document.iter(W + 'p'):
++        parts = []
++        for node in paragraph.iter():
++            if node.tag == W + 't':
++                parts.append(node.text or '')
++            elif node.tag in (W + 'br', W + 'cr'):
++                parts.append('\n')
++            elif node.tag == W + 'tab':
++                parts.append('\t')
++        paragraphs.append(''.join(parts))
++    text = '\n'.join(paragraphs).strip()
++    for required in ('RUMI: CHARACTER', '### 17. Openings and endings',
++                     '{{capabilities}}', '[RUMI CONNECTION POLICY]',
++                     '[RUMI BEHAVIOR POLICY]'):
++        if required not in text:
++            raise ValueError(f'Prompt document missing required section: {required}')
++    return text + '\n'
++
++
++def main():
++    with urllib.request.urlopen(URL, timeout=30) as response:
++        raw = response.read(5_000_001)
++    if len(raw) > 5_000_000:
++        raise ValueError('Prompt document exceeds download limit')
++    text = extract(raw)
++    out = Path(__file__).resolve().parents[1] / 'ios-rumi/Rumi/DemoAgentPrompt.txt'
++    old = out.read_text() if out.exists() else ''
++    out.write_text(text)
++    print(f'Prepared {len(text):,} characters in {out.name}')
++    print(f'Previous prompt identical: {old == text}')
++    print(f'SHA-256: {hashlib.sha256(text.encode()).hexdigest()}')
++
++
++if __name__ == '__main__':
++    main()
 diff --git a/tools/rumi-demo-codec/codec.ts b/tools/rumi-demo-codec/codec.ts
 new file mode 100644
 --- /dev/null
