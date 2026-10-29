@@ -168,15 +168,25 @@ struct DemoBrowserView: View {
     @State private var address = "https://www.myplate.gov/recipes"
     @State private var draft = ""
     @State private var consent = false
+    @State private var mockService: String?
+    private func openSource() {
+        let raw = address.trimmingCharacters(in: .whitespacesAndNewlines)
+        let host = URL(string: raw.contains("://") ? raw : "https://" + raw)?.host?.lowercased() ?? ""
+        if let service = ["instagram.com", "instacart.com", "uber.com"].first(where: { host == $0 || host.hasSuffix("." + $0) }) {
+            browser.stop(); mockService = service
+        } else { browser.open(raw) }
+    }
     @Environment(\.scenePhase) private var phase
     private var browser: DemoBrowserModel { demo.browser }
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 20) {
+                NavigationLink("Open login-free demo services") { DemoServicesView() }.frame(minHeight: 44)
+                Text("Instagram, Instacart and Uber addresses open labelled local mock pages here, never their login screens.").font(.callout).foregroundStyle(.secondary)
                 Text("Public recipe reader").font(.title.bold())
                 Text("Real source text, simplified for this demo. No sign-ins, website scripts, forms or merchant writes. This is not the live-account browser.").font(.callout).foregroundStyle(.secondary)
                 TextField("HTTPS recipe source", text: $address).keyboardType(.URL).textInputAutocapitalization(.never).autocorrectionDisabled().textFieldStyle(.roundedBorder).onChange(of: address) { _, _ in browser.takeControl() }
-                HStack { Button("Open source") { browser.open(address) }; Spacer(); Button("Stop") { browser.stop() } }.buttonStyle(.bordered).controlSize(.large)
+                HStack { Button("Open source") { openSource() }; Spacer(); Button("Stop") { browser.stop() } }.buttonStyle(.bordered).controlSize(.large)
                 if browser.loading { HStack { ProgressView(); Text("Loading actual source…") } }
                 if let error = browser.error { Text(error).foregroundStyle(.red) }
                 if let page = browser.page {
@@ -197,6 +207,14 @@ struct DemoBrowserView: View {
                 }
             }.padding(20)
         }.background { AmbientBackground() }.navigationTitle("Browse with Rumi").navigationBarTitleDisplayMode(.inline).demoLabel()
+        .navigationDestination(isPresented: Binding(get: { mockService != nil }, set: { if !$0 { mockService = nil } })) {
+            switch mockService {
+            case "instagram.com": DemoSocialRecipesView()
+            case "instacart.com": DemoMockCartView(recipe: .bowl)
+            case "uber.com": DemoMockRideView()
+            default: DemoServicesView()
+            }
+        }
         .sheet(item: Binding(get: { browser.proposal }, set: { if $0 == nil { browser.takeControl() } })) { proposal in
             NavigationStack {
                 ScrollView { VStack(alignment: .leading, spacing: 20) {

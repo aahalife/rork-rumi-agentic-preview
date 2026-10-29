@@ -131,6 +131,7 @@ struct DemoRecipeSourceView: View {
     var body: some View {
         Form {
             Section { Text("Read a real recipe with Sonnet 5.5. No sign-in, browsing cookies, account access or merchant changes.") }
+            Section("Login-free alternative") { NavigationLink("Instagram mock recipes & demo groceries") { DemoSocialRecipesView() }; Text("Seeded examples, separate from live recipe research below.").font(.footnote) }
             Section("Recipe source") {
                 TextField("Paste an HTTPS recipe link", text: $address).keyboardType(.URL).textInputAutocapitalization(.never).autocorrectionDisabled().onChange(of: address) { _, _ in research.clear(); confirmed = false; sourceSaved = false }
                 Link("Find a recipe on MyPlate", destination: URL(string: "https://www.myplate.gov/recipes")!)

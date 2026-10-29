@@ -11,6 +11,7 @@ FILES = (
     "ios-rumi/Rumi/HomeView.swift",
     "ios-rumi/Rumi/ContentView.swift",
     "ios-rumi/Rumi/DemoMode.swift",
+    "ios-rumi/Rumi/DemoServices.swift",
     "ios-rumi/Rumi/DemoBrowser.swift",
     "ios-rumi/Rumi/DemoRecipeResearch.swift",
     "ios-rumi/Rumi/DemoRealtimeBridge.swift",
