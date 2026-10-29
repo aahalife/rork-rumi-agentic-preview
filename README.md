@@ -8,7 +8,7 @@ Rumi helps people understand care information, prepare for visits, remember what
 
 ## Start here
 
-For a plain-English walkthrough of the current simplified iPhone and Web demos, start with [DEMO_GUIDE.md](DEMO_GUIDE.md). It includes copy-and-paste AI prompts, expected sample results, approval steps and platform limitations. The older product snapshot below is historical; use the guide and latest handoff checkpoints for the simplified experience.
+For a plain-English walkthrough of the current simplified iPhone and Web demos, start with [DEMO_GUIDE.md](DEMO_GUIDE.md). It includes presenter routes for Primary, Maria and Tom; copy-and-paste chat and voice scripts; charts, goals, barriers, medication support, symptoms, recipes and grocery reviews; and a separate owner-gated appendix for portal browsing, iMessage and calls. The older product snapshot below is historical; use the guide and latest handoff checkpoints for the simplified experience.
 
 | Document | Purpose |
 |---|---|
