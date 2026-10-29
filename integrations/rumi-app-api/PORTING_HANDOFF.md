@@ -1,6 +1,14 @@
 # Rumi insights and existing App API: collaborator handoff
 
-Prepared October 29, 2026. Scope: the simplified native `ios-rumi` app, not the larger `ios` or `web` UI. Preserve the designer's chat-first navigation, menu, Health screens and mint/forest-green styling. This is a portable implementation, not a claim of production activation or complete backend-PR parity.
+Prepared October 29, 2026. Primary scope: the simplified native `ios-rumi` app, not the larger `ios` UI. A simplified web port now exists as described below; native validation evidence does not transfer to it. Preserve the designer's chat-first navigation, menu, Health screens and mint/forest-green styling. This is a portable implementation, not a claim of production activation or complete backend-PR parity.
+
+### Web port checkpoint
+
+- `web/src/App.tsx` serves `web/src/rumi/RumiWeb.tsx` at `/`; the older `Index` remains at `/original/*`. No backend changes or native changes were required.
+- `model.ts` ports the three isolated fixtures, strict query validation/calculations and exact sample pantry/cart arithmetic; `ai.ts` uses the identical prompt and exact Sonnet model with consent, no fallback and host-calculated insight facts. `InsightCard.tsx` exposes SVG charts plus keyboard-accessible date/value rows. `rumi.css` scopes the native-inspired atmosphere and responsive controls.
+- `Account.tsx` implements the published owner-confirmed API directly with browser fetch, memory-only tokens, coalesced identity-checked refresh, verified challenge flow, read-only inspection and exact reviewed goal writes. It never uses server/provider credentials. Browser access needs existing-service CORS authorization. Dismissal clears local access but is not remote logout. Requests already dispatched may complete upstream even if aborted locally. Unknown goal outcomes require checking goals, never automatic replay.
+- Web voice is explicitly browser dictation, not realtime AI. Real-source recipe extraction/cart review and model-proposed reader navigation remain native-only; web supports public-source questions subject to CORS and separate seeded mock cart journeys. No cross-device/demo/account synchronization is implied.
+- Web static checks/build passed and one phone-sized welcome render was inspected. No web functional tests, live AI, microphone, authenticated API or comprehensive accessibility acceptance was performed. The portable native patch below has not been regenerated to contain web files; it remains a pre-web artifact.
 
 ## 1. Sources and provenance
 
