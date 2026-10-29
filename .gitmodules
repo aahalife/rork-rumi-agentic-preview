@@ -1,0 +1,4 @@
+[submodule "linked/rumi-research-preview"]
+	path = linked/rumi-research-preview
+	url = https://github.com/aahalife/rork-rumi-research-preview.git
+	branch = main

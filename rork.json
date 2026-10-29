@@ -1,0 +1,25 @@
+{
+  "$schema": "https://rork.com/schema/rork.json",
+  "apps": [
+    {
+      "name": "Nudge",
+      "path": "ios",
+      "framework": "swift"
+    },
+    {
+      "name": "Rumi",
+      "path": "web",
+      "framework": "web"
+    },
+    {
+      "name": "Rumi iPhone",
+      "path": "ios-rumi",
+      "framework": "swift"
+    },
+    {
+      "name": "Functions",
+      "path": "functions",
+      "framework": "cloudflare"
+    }
+  ]
+}

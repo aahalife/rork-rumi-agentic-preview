@@ -1,0 +1,9 @@
+node_modules
+.env
+.expo
+# Keep Rork project state and handoff plans tracked.
+
+# Cloudflare Functions
+functions/node_modules
+!functions/package.json
+.rork

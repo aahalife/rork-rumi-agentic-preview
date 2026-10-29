@@ -1,0 +1,76 @@
+import Foundation
+import Observation
+import WebKit
+
+@Observable
+final class CompanionModel {
+    var isCollapsed: Bool = false
+    var browser: BrowserModel = BrowserModel()
+    var session: AgentSession?
+    var backendURL: URL?
+    var portalURL: URL = HostedEndpoints.portal
+    var savedAddress: String { HostedEndpoints.backend.absoluteString }
+
+    init() {
+        #if DEBUG
+        if CommandLine.arguments.contains("-LindenUITestFresh") { return }
+        #endif
+        let address = savedAddress
+        if let url = Self.validatedURL(address), let key = KeychainStore.load(account: "demo-key:" + url.absoluteString) {
+            configure(url: url, key: key)
+        }
+    }
+
+    nonisolated static func validatedURL(_ address: String) -> URL? {
+        guard let parts = URLComponents(string: address.trimmingCharacters(in: .whitespacesAndNewlines)),
+              parts.scheme == "https", let host = parts.host, !host.isEmpty,
+              parts.user == nil, parts.password == nil, parts.query == nil, parts.fragment == nil,
+              parts.path.isEmpty || parts.path == "/" else { return nil }
+        return parts.url
+    }
+
+    func connect(address: String, key: String) async throws {
+        guard let url = Self.validatedURL(address), url == HostedEndpoints.backend, !key.isEmpty else {
+            throw BridgeError.refused("Enter your private demo access code.")
+        }
+        let client = URLSession(configuration: .ephemeral)
+        defer { client.invalidateAndCancel() }
+        let acceptedKey = try await PrivateAccessConnection.validate(key: key, status: { code in
+            var request = URLRequest(url: url.appending(path: "demo/status"))
+            request.httpMethod = "GET"
+            request.timeoutInterval = 12
+            request.cachePolicy = .reloadIgnoringLocalCacheData
+            request.setValue(code, forHTTPHeaderField: "X-Demo-Key")
+            let (_, response) = try await client.data(for: request)
+            return (response as? HTTPURLResponse)?.statusCode ?? 0
+        })
+        try Task.checkCancellation()
+        try KeychainStore.save(acceptedKey, account: "demo-key:" + url.absoluteString)
+        configure(url: url, key: acceptedKey)
+    }
+
+    func removeDemoAccess() async {
+        session?.disconnect()
+        let dataStore = browser.webView?.configuration.websiteDataStore
+        browser.webView?.stopLoading()
+        await DeviceSignIn.shared.forget(backendOrigin: portalURL)
+        if let backendURL { KeychainStore.delete(account: "demo-key:" + backendURL.absoluteString) }
+        session = nil
+        backendURL = nil
+        browser = BrowserModel()
+        if let dataStore {
+            await dataStore.removeData(ofTypes: WKWebsiteDataStore.allWebsiteDataTypes(), modifiedSince: .distantPast)
+        }
+    }
+
+    private func configure(url: URL, key: String) {
+        session?.disconnect()
+        browser = BrowserModel()
+        browser.privateAccessCode = key
+        backendURL = url
+        portalURL = HostedEndpoints.portal
+        DeviceSignIn.shared.configure(origin: portalURL)
+        let bridge = AgentBridge(backendOrigin: portalURL, browser: browser)
+        session = AgentSession(backendURL: url, demoKey: key, bridge: bridge)
+    }
+}
