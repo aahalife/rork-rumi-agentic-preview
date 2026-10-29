@@ -105,12 +105,15 @@ struct HomeView: View {
             } message: {
                 Text("Your messages are sent to your configured AI service and stored as your conversation. If you link iMessage, that verified conversation shares this history. You can disconnect this device in Account.")
             }
+            .onReceive(NotificationCenter.default.publisher(for: Notification.Name("RumiDemoWillEnter"))) { _ in
+                store.stop(); works.takeControl()
+            }
             .onChange(of: CompanionConnection.shared.identityVersion) { _, _ in
                 store.stop(); store = ChatStore(); works.takeControl()
             }
             .task {
                 while !Task.isCancelled {
-                    if scenePhase == .active, editingMessageID == nil { await store.sync() }
+                    if scenePhase == .active, editingMessageID == nil, !DemoSession.shared.isPresented { await store.sync() }
                     do { try await Task.sleep(for: .seconds(15)) } catch { return }
                 }
             }
@@ -234,12 +237,16 @@ struct HomeView: View {
 private struct MenuView: View {
     let openWorks: () -> Void
     let openRecipes: () -> Void
+    @State private var showingDemo = false
     @Environment(\.dismiss) private var dismiss
 
     var body: some View {
         NavigationStack {
             ScrollView {
                 VStack(spacing: 0) {
+                    Button { showingDemo = true } label: { menuRow("Explore demo members", icon: .user) }
+                        .buttonStyle(GlassRowButtonStyle())
+                    GlassDivider()
                     Button(action: openWorks) { menuRow("Rumi Works", icon: .sparkles) }
                         .buttonStyle(GlassRowButtonStyle())
                     GlassDivider()
@@ -267,6 +274,7 @@ private struct MenuView: View {
                 .padding(.top, 16)
             }
             .background { ScreenBackground() }
+            .fullScreenCover(isPresented: $showingDemo) { DemoEntryView() }
             .navigationTitle("Menu")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {

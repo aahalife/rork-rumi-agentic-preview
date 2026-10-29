@@ -9,6 +9,17 @@ ROOT = Path(__file__).resolve().parents[1]
 BASE = ROOT / "linked/rumi-research-preview"
 FILES = (
     "ios-rumi/Rumi/HomeView.swift",
+    "ios-rumi/Rumi/ContentView.swift",
+    "ios-rumi/Rumi/DemoMode.swift",
+    "ios-rumi/Rumi/DemoBrowser.swift",
+    "ios-rumi/Rumi/DemoRecipeResearch.swift",
+    "ios-rumi/Rumi/DemoRealtimeBridge.swift",
+    "ios-rumi/Rumi/DemoRealtimeCodec.js",
+    "ios-rumi/Rumi/DemoAgentPrompt.txt",
+    "tools/prepare-rumi-demo-prompt.py",
+    "tools/rumi-demo-codec/codec.ts",
+    "tools/rumi-demo-codec/package.json",
+    "tools/rumi-demo-codec/bun.lock",
     "ios-rumi/Rumi/ChatModels.swift",
     "ios-rumi/Rumi/WorksModel.swift",
     "ios-rumi/Rumi/WorksBridge.swift",

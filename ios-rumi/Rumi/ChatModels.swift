@@ -133,10 +133,10 @@ final class ChatStore {
     }
 
     func sync() async {
-        guard !isResponding, CompanionConnection.shared.connected else { return }
+        guard !isResponding, CompanionConnection.shared.connected, !DemoSession.shared.isPresented else { return }
         do {
             let remote: RemoteConversation = try await CompanionConnection.shared.request("messages")
-            guard !isResponding else { return }
+            guard !isResponding, !DemoSession.shared.isPresented else { return }
             let old = Dictionary(uniqueKeysWithValues: messages.map { ($0.id, $0) })
             messages = remote.messages.map { entry in
                 let hash = SHA256.hash(data: Data(entry.id.utf8)).map { String(format: "%02x", $0) }.joined()

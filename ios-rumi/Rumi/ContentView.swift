@@ -28,6 +28,7 @@ struct WelcomeView: View {
 
     @State private var appeared = false
     @State private var path: [AppRoute] = []
+    @State private var showingDemo = false
     @State private var phone = ""
     @State private var country = Country(iso: "US", name: "United States", dialCode: "+1")
 
@@ -72,6 +73,10 @@ struct WelcomeView: View {
 
             // Actions
             VStack(spacing: 18) {
+                Button("Explore a demo") { showingDemo = true }
+                    .font(.rumiHeadline)
+                    .frame(minHeight: 44)
+                    .tint(.brandPrimary)
                 Button {
                     path.append(.auth(.newUser))
                 } label: {
@@ -102,6 +107,7 @@ struct WelcomeView: View {
         .padding(.horizontal, .screenMargin)
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .background { AmbientBackground() }
+        .fullScreenCover(isPresented: $showingDemo) { DemoEntryView() }
         .navigationDestination(for: AppRoute.self) { route in
             switch route {
             case .auth(let flow):

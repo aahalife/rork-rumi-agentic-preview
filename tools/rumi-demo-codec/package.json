@@ -1,0 +1,7 @@
+{
+  "dependencies": {
+    "@ai-sdk/gateway": "^4.0.0-canary.107",
+    "ai": "^7.0.0-canary.176",
+    "esbuild": "^0.28.2"
+  }
+}
